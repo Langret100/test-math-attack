@@ -1,47 +1,981 @@
 <!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-    <title>MathAttack | 메스어택</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-      body, html, #root {
-        width: 100%;
-        height: 100%;
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        background-color: #000;
-        touch-action: none;
-      }
-      /* Ensure canvas doesn't capture weird touch highlights on mobile */
-      canvas {
-        outline: none;
-        -webkit-tap-highlight-color: rgba(255, 255, 255, 0);
-      }
-    </style>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <title>MathAttack | 메스어택</title>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body,html,#root{width:100%;height:100%;overflow:hidden;background:#000;touch-action:none;font-family:system-ui,sans-serif}
+    canvas{outline:none;display:block}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @keyframes dmgflash{0%{opacity:.6}100%{opacity:0}}
+    @keyframes msgpop{0%{opacity:0;transform:translate(-50%,-8px)}15%{opacity:1}80%{opacity:1}100%{opacity:0;transform:translate(-50%,6px)}}
+    @keyframes warnpulse{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
+    @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+  </style>
   <script type="importmap">
-{
-  "imports": {
-    "react": "https://esm.sh/react@18.3.1",
-    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime?external=react",
-    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
-    "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
-    "three": "https://esm.sh/three@0.167.1",
-    "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.17.6?external=react,react-dom,three",
-    "@react-three/drei": "https://esm.sh/@react-three/drei@9.112.0?external=react,react-dom,three,@react-three/fiber",
-    "@mediapipe/tasks-vision": "https://esm.run/@mediapipe/tasks-vision@0.10.9",
-    "lucide-react": "https://esm.sh/lucide-react@0.436.0?external=react",
-    "react-dom/": "https://esm.sh/react-dom@^19.2.0/",
-    "react/": "https://esm.sh/react@^19.2.0/"
+  {
+    "imports": {
+      "react":              "https://esm.sh/react@18.3.1",
+      "react/jsx-runtime":  "https://esm.sh/react@18.3.1/jsx-runtime?external=react",
+      "react-dom/client":   "https://esm.sh/react-dom@18.3.1/client?external=react",
+      "react-dom":          "https://esm.sh/react-dom@18.3.1?external=react",
+      "three":              "https://esm.sh/three@0.167.1",
+      "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.17.6?external=react,react-dom,three",
+      "@react-three/drei":  "https://esm.sh/@react-three/drei@9.112.0?external=react,react-dom,three,@react-three/fiber",
+      "@mediapipe/tasks-vision": "https://esm.run/@mediapipe/tasks-vision@0.10.9"
+    }
   }
-}
-</script>
-<link rel="stylesheet" href="/index.css">
+  </script>
 </head>
-  <body>
-    <div id="root"></div>
-  <script type="module" src="/index.tsx"></script>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-type="module" data-presets="react">
+import React,{useRef,useState,useEffect,useCallback,useMemo}from'react';
+import ReactDOM from'react-dom/client';
+import{Canvas,useFrame}from'@react-three/fiber';
+import{Grid,PerspectiveCamera,Stars,Text}from'@react-three/drei';
+import*as THREE from'three';
+import{HandLandmarker,FaceDetector,FilesetResolver}from'@mediapipe/tasks-vision';
+
+// ══════════════════════════════════════════════════════
+// 상수
+// ══════════════════════════════════════════════════════
+const GS={LOADING:'LOADING',IDLE:'IDLE',PLAYING:'PLAYING',GAME_OVER:'GAME_OVER',VICTORY:'VICTORY'};
+const COL={left:'#ef4444',right:'#3b82f6',correct:'#f59e0b',heart:'#ec4899',obstacle:'#ff4400'};
+
+const SPAWN_Z   = -30;
+const PLAYER_Z  = 0;
+const MISS_Z    = 5;
+const NOTE_SPEED= 8;   // 조금 느리게 → 판단 여유
+const BPM=140, BEAT=60/BPM;
+const LANE_X  = [-1.5, -0.5, 0.5, 1.5];
+const LAYER_Y = [0.7, 1.5, 2.3];
+const MULT_OPTS=[2,3,4,5,6,7,8,9,10];
+const MAX_HEARTS=3;
+const SONG_URL='https://commondatastorage.googleapis.com/codeskulptor-demos/riceracer_assets/music/race2.ogg';
+
+// 판 크기
+const PANEL_W=0.72, PANEL_H=0.72, PANEL_D=0.10;
+
+// ══════════════════════════════════════════════════════
+// 난이도별 채보 생성
+// 처음엔 1~2개씩 띄엄띄엄, 점점 촘촘해짐
+// ══════════════════════════════════════════════════════
+const rnd=a=>a[Math.floor(Math.random()*a.length)];
+const mulOf=f=>{const m=[];for(let i=f;i<=100;i+=f)m.push(i);return rnd(m);};
+const nonMulOf=f=>{const m=[];for(let i=1;i<=100;i++)if(i%f!==0)m.push(i);return rnd(m);};
+
+function generateChart(){
+  const notes=[], obs=[];
+  let id=0, oi=0;
+  const aL=[0,1,2], aLn=[0,1,2,3], lLn=[0,1], rLn=[2,3];
+
+  // 총 곡 길이 약 95초 (BPM 140 기준 220비트)
+  // 구간 설정:
+  //   0~30s  (비트 0~70):   간격 8비트, 단타 위주
+  //   30~55s (비트 70~129): 간격 4비트, 가끔 더블
+  //   55~75s (비트 129~175):간격 2비트, 더블 포함
+  //   75s~   (비트 175~):   간격 2비트, 트리플 포함
+
+  const mk=(type,li,ll,t)=>({id:`n${id++}`,time:t,lineIndex:li,lineLayer:ll,type,noteType:'note',numVal:0});
+
+  // ─ 구간 1: 간격 8비트 (한 번에 1개)
+  for(let i=8; i<70; i+=8){
+    const t=i*BEAT;
+    const side=i%16===0?'left':'right';
+    notes.push(mk(side, side==='left'?rnd(lLn):rnd(rLn), rnd(aL), t));
+  }
+
+  // ─ 구간 2: 간격 4비트 (가끔 동시 2개)
+  for(let i=70; i<129; i+=4){
+    const t=i*BEAT;
+    if(i%8===0){
+      // 동시 2개
+      notes.push(mk('left',  rnd(lLn), rnd(aL), t));
+      notes.push(mk('right', rnd(rLn), rnd(aL), t));
+    } else {
+      const side=i%8===4?'left':'right';
+      notes.push(mk(side, side==='left'?rnd(lLn):rnd(rLn), rnd(aL), t));
+    }
+  }
+
+  // ─ 구간 3: 간격 2비트, 더블 포함
+  for(let i=129; i<175; i+=2){
+    const t=i*BEAT;
+    if(i%8===0){
+      notes.push(mk('left',  rnd(lLn), rnd(aL), t));
+      notes.push(mk('right', rnd(rLn), rnd(aL), t));
+    } else {
+      notes.push(mk(i%4===0?'left':'right', rnd(aLn), rnd(aL), t));
+    }
+  }
+
+  // ─ 구간 4: 2비트, 트리플/쿼드 포함
+  for(let i=175; i<220; i+=2){
+    const t=i*BEAT;
+    if(i%8===0){
+      // 쿼드
+      [0,1].forEach(li=>notes.push(mk('left',  li,    [0,2][li],   t)));
+      [2,3].forEach(li=>notes.push(mk('right', li,    [0,2][li-2], t)));
+    } else if(i%4===0){
+      notes.push(mk('left',  rnd(lLn), rnd(aL), t));
+      notes.push(mk('right', rnd(rLn), rnd(aL), t));
+    } else {
+      notes.push(mk(rnd(['left','right']), rnd(aLn), rnd(aL), t));
+    }
+  }
+
+  // ─ 하트: 구간 2 이후부터 32비트마다
+  for(let i=80; i<220; i+=32)
+    notes.push({id:`h${id++}`,time:i*BEAT,lineIndex:rnd([1,2]),lineLayer:1,
+      type:rnd(['left','right']),noteType:'heart',numVal:0});
+
+  // ─ 장애물: 구간 2부터 20비트마다
+  const ot=['top','left','right'];
+  for(let i=80; i<220; i+=20)
+    obs.push({id:`o${oi++}`,time:i*BEAT,obstacleType:ot[Math.floor(i/20)%3]});
+
+  return{
+    notes:   notes.sort((a,b)=>a.time-b.time),
+    obstacles:obs.sort((a,b)=>a.time-b.time)
+  };
+}
+
+const BASE=generateChart();
+
+function freshChart(mult){
+  return{
+    notes: BASE.notes.map(n=>{
+      const cp={...n,hit:false,missed:false,hitTime:undefined};
+      if(n.noteType==='note') cp.numVal=Math.random()<0.65?mulOf(mult):nonMulOf(mult);
+      return cp;
+    }),
+    obstacles: BASE.obstacles.map(o=>({...o,hit:false}))
+  };
+}
+
+// ══════════════════════════════════════════════════════
+// useMediaPipe
+// ══════════════════════════════════════════════════════
+const mapH2W=(x,y,vw,vh)=>{
+  // 화면 비율 고려한 매핑
+  const aspect=vw/vh;
+  const rangeX=aspect>1?5:3.5;
+  const wx=(0.5-x)*rangeX;
+  const wy=(1-y)*3.5-1.75+0.8;
+  return new THREE.Vector3(wx,Math.max(0.05,wy),-Math.max(0,wy*0.15));
+};
+
+function useMediaPipe(videoRef){
+  const[ready,setReady]=useState(false);
+  const[err,setErr]=useState(null);
+  const hpRef=useRef({
+    left:null,right:null,
+    leftVelocity:new THREE.Vector3(),
+    rightVelocity:new THREE.Vector3(),
+    lastTs:0
+  });
+  const headRef=useRef({x:0.5,y:0.5,detected:false});
+  const lrRef=useRef(null);
+  const hlRef=useRef(null),fdRef=useRef(null),rafRef=useRef(0);
+
+  useEffect(()=>{
+    let active=true;
+    async function setup(){
+      try{
+        const vision=await FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm');
+        if(!active)return;
+        const[hl,fd]=await Promise.all([
+          HandLandmarker.createFromOptions(vision,{
+            baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},
+            runningMode:'VIDEO',numHands:2,
+            minHandDetectionConfidence:0.5,minHandPresenceConfidence:0.5,minTrackingConfidence:0.5
+          }),
+          FaceDetector.createFromOptions(vision,{
+            baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',delegate:'GPU'},
+            runningMode:'VIDEO',minDetectionConfidence:0.5
+          })
+        ]);
+        if(!active){hl.close();fd.close();return;}
+        hlRef.current=hl; fdRef.current=fd;
+        const stream=await navigator.mediaDevices.getUserMedia(
+          {video:{facingMode:'user',width:{ideal:640},height:{ideal:480}}});
+        if(videoRef.current&&active){
+          videoRef.current.srcObject=stream;
+          videoRef.current.onloadeddata=()=>{if(active){setReady(true);predict();}};
+        }
+      }catch(e){console.error(e);setErr(e.message);}
+    }
+
+    function predict(){
+      if(!videoRef.current||!hlRef.current||!active)return;
+      const v=videoRef.current;
+      if(v.videoWidth>0){
+        const t=performance.now();
+        try{
+          const hr=hlRef.current.detectForVideo(v,t);
+          lrRef.current=hr;
+          const s=hpRef.current, dt=(t-s.lastTs)/1000; s.lastTs=t;
+          let nL=null,nR=null;
+          if(hr.landmarks) for(let i=0;i<hr.landmarks.length;i++){
+            // 손목(0) ~ 검지끝(8) 중간점으로 히트 판정 → 더 넓은 영역
+            const lm=hr.landmarks[i];
+            const mx=(lm[0].x+lm[8].x+lm[12].x)/3;
+            const my=(lm[0].y+lm[8].y+lm[12].y)/3;
+            const isR=hr.handedness[i][0].categoryName==='Right';
+            const wp=mapH2W(mx,my,v.videoWidth,v.videoHeight);
+            if(isR)nR=wp; else nL=wp;
+          }
+          // LERP smoothing 더 강하게 (매끄러운 움직임)
+          const LERP=0.45;
+          if(nL){
+            if(s.left){
+              const smoothed=new THREE.Vector3().lerpVectors(s.left,nL,LERP);
+              if(dt>0.001) s.leftVelocity.subVectors(smoothed,s.left).divideScalar(dt);
+              s.left=smoothed;
+            }else s.left=nL;
+          }else s.left=null;
+          if(nR){
+            if(s.right){
+              const smoothed=new THREE.Vector3().lerpVectors(s.right,nR,LERP);
+              if(dt>0.001) s.rightVelocity.subVectors(smoothed,s.right).divideScalar(dt);
+              s.right=smoothed;
+            }else s.right=nR;
+          }else s.right=null;
+
+          if(fdRef.current){
+            const fr=fdRef.current.detectForVideo(v,t);
+            if(fr.detections?.length>0){
+              const bb=fr.detections[0].boundingBox;
+              headRef.current={
+                x:(bb.originX+bb.width/2)/v.videoWidth,
+                y:(bb.originY+bb.height/2)/v.videoHeight,
+                detected:true
+              };
+            }else headRef.current={x:0.5,y:0.5,detected:false};
+          }
+        }catch(e){}
+      }
+      rafRef.current=requestAnimationFrame(predict);
+    }
+    setup();
+    return()=>{
+      active=false; cancelAnimationFrame(rafRef.current);
+      hlRef.current?.close(); fdRef.current?.close();
+      if(videoRef.current?.srcObject)
+        videoRef.current.srcObject.getTracks().forEach(t=>t.stop());
+    };
+  },[videoRef]);
+  return{isCameraReady:ready,handPositionsRef:hpRef,headPositionRef:headRef,lastResultsRef:lrRef,error:err};
+}
+
+// ══════════════════════════════════════════════════════
+// Saber (기존 1.5배 → 추가 50% = 2.25배)
+// ══════════════════════════════════════════════════════
+function Saber({type,posRef,velRef}){
+  const grp=useRef();
+  const col=type==='left'?COL.left:COL.right;
+  const L=2.25;   // 원본 1.0 × 2.25
+
+  // 별도 smooth pos/rot
+  const smoothPos=useRef(new THREE.Vector3());
+  const smoothRx=useRef(-Math.PI/3.5);
+  const smoothRz=useRef(type==='left'?0.2:-0.2);
+
+  useFrame((_,dt)=>{
+    if(!grp.current)return;
+    const p=posRef.current, v=velRef.current;
+    if(p){
+      grp.current.visible=true;
+      // 위치 스무딩
+      smoothPos.current.lerp(p,0.35);
+      grp.current.position.copy(smoothPos.current);
+      // 회전 스무딩
+      const targetRx=-Math.PI/3.5+(v?v.y*0.04+v.z*0.015:0);
+      const targetRz=(type==='left'?0.2:-0.2)+(v?-v.x*0.04:0);
+      smoothRx.current=THREE.MathUtils.lerp(smoothRx.current,targetRx,0.18);
+      smoothRz.current=THREE.MathUtils.lerp(smoothRz.current,targetRz,0.18);
+      grp.current.rotation.x=smoothRx.current;
+      grp.current.rotation.z=smoothRz.current;
+    }else grp.current.visible=false;
+  });
+
+  return(
+    <group ref={grp}>
+      {/* 손잡이 */}
+      <mesh position={[0,-0.09,0]}>
+        <cylinderGeometry args={[0.03,0.03,0.18,10]}/>
+        <meshStandardMaterial color="#222" roughness={0.6} metalness={0.9}/>
+      </mesh>
+      {/* 가드 */}
+      <mesh position={[0,0.02,0]}>
+        <cylinderGeometry args={[0.05,0.035,0.07,10]}/>
+        <meshStandardMaterial color="#888" roughness={0.2} metalness={1}/>
+      </mesh>
+      {/* 블레이드 코어 */}
+      <mesh position={[0,0.07+L/2,0]}>
+        <cylinderGeometry args={[0.012,0.012,L,8]}/>
+        <meshBasicMaterial color="white" toneMapped={false}/>
+      </mesh>
+      {/* 블레이드 글로우 */}
+      <mesh position={[0,0.07+L/2,0]}>
+        <capsuleGeometry args={[0.032,L,8,12]}/>
+        <meshStandardMaterial color={col} emissive={col} emissiveIntensity={6}
+          toneMapped={false} transparent opacity={0.5}/>
+      </mesh>
+      <pointLight color={col} intensity={4} distance={5} decay={2} position={[0,0.9,0]}/>
+    </group>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// NoteComp — 네모 판 + 앞면 숫자
+// ══════════════════════════════════════════════════════
+// 공유 geometry
+const panelGeo=new THREE.BoxGeometry(PANEL_W,PANEL_H,PANEL_D);
+
+function HitBurst({color,tsh}){
+  const g=useRef();
+  useFrame(()=>{if(g.current)g.current.scale.setScalar(Math.max(0.01,1-tsh*2.2));});
+  const pts=[[0,1],[1,0],[-1,0],[0,-1],[0.7,0.7],[-0.7,0.7],[0.7,-0.7],[-0.7,-0.7]];
+  return(
+    <group ref={g}>
+      {pts.map(([mx,my],i)=>{
+        const Pt=()=>{
+          const r=useRef();
+          useFrame(()=>{if(r.current)r.current.position.set(mx*5*tsh,my*5*tsh,0);});
+          return<mesh ref={r}><sphereGeometry args={[0.07,5,5]}/><meshBasicMaterial color={color} toneMapped={false}/></mesh>;
+        };
+        return<Pt key={i}/>;
+      })}
+    </group>
+  );
+}
+
+function NoteComp({data,zPos,currentTime,mult}){
+  const isHeart=data.noteType==='heart';
+  const isCorrect=!isHeart&&data.numVal%mult===0;
+  // 색: 하트=분홍, 정답=금색, 왼손오답=어두운빨강, 오른손오답=어두운파랑
+  const faceCol=isHeart?COL.heart:isCorrect?COL.correct:(data.type==='left'?COL.left:COL.right);
+  const bodyCol=isHeart?'#7c1d4e':isCorrect?'#78350f':(data.type==='left'?'#7f1d1d':'#1e3a5f');
+
+  const pos=useMemo(()=>[LANE_X[data.lineIndex],LAYER_Y[data.lineLayer],zPos],
+    [data.lineIndex,data.lineLayer,zPos]);
+
+  if(data.missed)return null;
+  if(data.hit&&data.hitTime!=null)
+    return<group position={pos}><HitBurst color={faceCol} tsh={currentTime-data.hitTime}/></group>;
+
+  return(
+    <group position={pos}>
+      {/* 판 본체 */}
+      <mesh geometry={panelGeo}>
+        <meshStandardMaterial color={bodyCol} roughness={0.4} metalness={0.3}/>
+      </mesh>
+      {/* 앞면 테두리 강조 */}
+      <mesh position={[0,0,PANEL_D/2+0.001]}>
+        <planeGeometry args={[PANEL_W,PANEL_H]}/>
+        <meshBasicMaterial color={faceCol} transparent opacity={0.18}/>
+      </mesh>
+      {/* 앞면 숫자 (고정, 회전 없음) */}
+      {isHeart
+        ?<Text position={[0,0,PANEL_D/2+0.012]} fontSize={PANEL_H*0.62}
+            color="#fff" anchorX="center" anchorY="middle">♥</Text>
+        :<Text position={[0,0,PANEL_D/2+0.012]} fontSize={PANEL_H*0.52}
+            color="#fff" anchorX="center" anchorY="middle" fontWeight="bold"
+            outlineColor={faceCol} outlineWidth={0.015}>
+            {data.numVal}
+          </Text>
+      }
+      {/* 테두리 glow */}
+      <lineSegments>
+        <edgesGeometry args={[panelGeo]}/>
+        <lineBasicMaterial color={faceCol} toneMapped={false}/>
+      </lineSegments>
+    </group>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// ObsComp — 장애물 (상/좌/우)
+// ══════════════════════════════════════════════════════
+const obsGeoH=new THREE.BoxGeometry(5.2,0.6,0.4);
+const obsGeoV=new THREE.BoxGeometry(0.6,4.0,0.4);
+const obsCone=new THREE.ConeGeometry(0.35,0.6,3);
+
+function ObsComp({data,zPos}){
+  const matRef=useRef();
+  useFrame(s=>{
+    if(matRef.current)
+      matRef.current.emissiveIntensity=0.5+Math.sin(s.clock.elapsedTime*6)*0.5;
+  });
+  const col=COL.obstacle;
+  const Mat=()=><meshStandardMaterial ref={matRef} color={col} emissive={col}
+    emissiveIntensity={0.7} roughness={0.3} metalness={0.5} transparent opacity={0.9}/>;
+
+  if(data.obstacleType==='top') return(
+    <group position={[0,3.0,zPos]}>
+      <mesh geometry={obsGeoH}><Mat/></mesh>
+      {[-2,-0.7,0.7,2].map((x,i)=>(
+        <mesh key={i} position={[x,-0.2,0.22]}>
+          <planeGeometry args={[0.35,0.25]}/>
+          <meshBasicMaterial color="#ffe600" side={THREE.DoubleSide}/>
+        </mesh>
+      ))}
+      <mesh position={[0,-0.5,0.22]} rotation={[0,0,Math.PI]} geometry={obsCone}>
+        <meshBasicMaterial color="#fff"/>
+      </mesh>
+      <pointLight color={col} intensity={2} distance={4} decay={2}/>
+    </group>
+  );
+  if(data.obstacleType==='left') return(
+    <group position={[-2.7,1.6,zPos]}>
+      <mesh geometry={obsGeoV}><Mat/></mesh>
+      <mesh position={[0.5,0,0.22]} rotation={[0,0,-Math.PI/2]} geometry={obsCone}>
+        <meshBasicMaterial color="#fff"/>
+      </mesh>
+      <pointLight color={col} intensity={2} distance={4} decay={2}/>
+    </group>
+  );
+  return(
+    <group position={[2.7,1.6,zPos]}>
+      <mesh geometry={obsGeoV}><Mat/></mesh>
+      <mesh position={[-0.5,0,0.22]} rotation={[0,0,Math.PI/2]} geometry={obsCone}>
+        <meshBasicMaterial color="#fff"/>
+      </mesh>
+      <pointLight color={col} intensity={2} distance={4} decay={2}/>
+    </group>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// WebcamPreview — 실제 카메라 영상 + 뼈대
+// ══════════════════════════════════════════════════════
+const HCONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
+
+function WebcamPreview({videoRef,resultsRef,isCameraReady}){
+  const cv=useRef();
+  useEffect(()=>{
+    if(!isCameraReady)return;
+    let af;
+    const draw=()=>{
+      const c=cv.current,v=videoRef.current;
+      if(c&&v&&v.readyState>=2){
+        const W=c.width,H=c.height,ctx=c.getContext('2d');
+        // 좌우반전 카메라 영상
+        ctx.save();ctx.scale(-1,1);ctx.translate(-W,0);
+        ctx.drawImage(v,0,0,W,H);
+        ctx.restore();
+        // 손 뼈대
+        const res=resultsRef.current;
+        if(res?.landmarks){
+          for(let i=0;i<res.landmarks.length;i++){
+            const lms=res.landmarks[i];
+            const isR=res.handedness[i]?.[0]?.categoryName==='Right';
+            const col=isR?COL.right:COL.left;
+            ctx.strokeStyle=col;ctx.lineWidth=2.5;ctx.lineCap='round';ctx.lineJoin='round';
+            ctx.beginPath();
+            for(const[a,b]of HCONN){
+              const p1=lms[a],p2=lms[b];
+              ctx.moveTo((1-p1.x)*W,p1.y*H);ctx.lineTo((1-p2.x)*W,p2.y*H);
+            }
+            ctx.stroke();
+            ctx.fillStyle=col;
+            for(const lm of lms){ctx.beginPath();ctx.arc((1-lm.x)*W,lm.y*H,3,0,Math.PI*2);ctx.fill();}
+            const tip=lms[8];
+            ctx.fillStyle='#fff';ctx.beginPath();ctx.arc((1-tip.x)*W,tip.y*H,5,0,Math.PI*2);ctx.fill();
+          }
+        }
+      }
+      af=requestAnimationFrame(draw);
+    };
+    draw();
+    return()=>cancelAnimationFrame(af);
+  },[isCameraReady,videoRef,resultsRef]);
+
+  if(!isCameraReady)return null;
+  return(
+    <div style={{position:'fixed',bottom:8,right:8,
+      width:'clamp(120px,18vw,200px)',
+      aspectRatio:'4/3',
+      border:'2px solid rgba(59,130,246,0.45)',borderRadius:9,overflow:'hidden',
+      zIndex:50,pointerEvents:'none',background:'#000'}}>
+      <div style={{position:'absolute',top:0,left:0,right:0,zIndex:1,
+        background:'rgba(0,0,0,.6)',fontSize:9,color:'rgba(147,197,253,.8)',
+        padding:'2px 6px',fontFamily:'monospace',letterSpacing:2}}>CAMERA</div>
+      <canvas ref={cv} width={320} height={240}
+        style={{display:'block',width:'100%',height:'100%',marginTop:14}}/>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// GameScene
+// ══════════════════════════════════════════════════════
+function GameScene({gameStatus,audioRef,handPositionsRef,headPositionRef,
+                    notes,obstacles,mult,
+                    onNoteHit,onNoteMiss,onObstacleHit,onSongEnd,onMultChange}){
+
+  const notesRef=useRef(notes), obsRef=useRef(obstacles);
+  const[tick,setTick]=useState(0);
+  const bump=useCallback(()=>setTick(t=>t+1),[]);
+
+  const[ct,setCt]=useState(0);
+  const anRef=useRef([]),aoRef=useRef([]),niRef=useRef(0),oiRef=useRef(0);
+  const shk=useRef(0),camRef=useRef(),ambRef=useRef(),spotRef=useRef();
+  const lmcRef=useRef(0),obsCool=useRef(0);
+  const vA=useMemo(()=>new THREE.Vector3(),[]);
+  const lastCtTs=useRef(0);
+
+  useEffect(()=>{
+    notesRef.current=notes; obsRef.current=obstacles;
+    anRef.current=[]; aoRef.current=[];
+    niRef.current=0; oiRef.current=0;
+    lmcRef.current=0; obsCool.current=0;
+    setCt(0); bump();
+  },[notes,obstacles]);
+
+  useFrame((_,dt)=>{
+    if(audioRef.current&&gameStatus===GS.PLAYING){
+      const t=audioRef.current.currentTime;
+      const pulse=Math.pow(1-((t%BEAT)/BEAT),4);
+      if(ambRef.current)ambRef.current.intensity=0.1+pulse*0.22;
+      if(spotRef.current)spotRef.current.intensity=0.5+pulse*1.2;
+    }
+    if(shk.current>0&&camRef.current){
+      const sh=shk.current;
+      camRef.current.position.set((Math.random()-.5)*sh,1.8+(Math.random()-.5)*sh,4+(Math.random()-.5)*sh);
+      shk.current=THREE.MathUtils.lerp(shk.current,0,14*dt);
+      if(shk.current<0.01){shk.current=0;camRef.current.position.set(0,1.8,4);}
+    }
+
+    if(gameStatus!==GS.PLAYING||!audioRef.current)return;
+    const time=audioRef.current.currentTime;
+
+    const now=performance.now();
+    if(now-lastCtTs.current>14){lastCtTs.current=now;setCt(time);}
+
+    if(audioRef.current.ended){onSongEnd();return;}
+
+    if(time-lmcRef.current>30){
+      lmcRef.current=time;
+      onMultChange(MULT_OPTS[Math.floor(Math.random()*MULT_OPTS.length)]);
+    }
+
+    const ahead=Math.abs(SPAWN_Z-PLAYER_Z)/NOTE_SPEED;
+    const ns=notesRef.current, os=obsRef.current;
+    while(niRef.current<ns.length){
+      const n=ns[niRef.current];
+      if(n.time-ahead<=time){anRef.current.push(n);niRef.current++;}else break;
+    }
+    while(oiRef.current<os.length){
+      const o=os[oiRef.current];
+      if(o.time-ahead<=time){aoRef.current.push(o);oiRef.current++;}else break;
+    }
+
+    const h=handPositionsRef.current, hd=headPositionRef.current;
+
+    // 노트 충돌 — 히트 반경 확대 (1.1)
+    for(let i=anRef.current.length-1;i>=0;i--){
+      const n=anRef.current[i];
+      if(n.hit||n.missed)continue;
+      const cz=PLAYER_Z-(n.time-time)*NOTE_SPEED;
+      if(cz>MISS_Z){
+        n.missed=true;
+        const ok=n.noteType==='heart'||n.numVal%mult===0;
+        if(ok)onNoteMiss(n);
+        anRef.current.splice(i,1);bump();continue;
+      }
+      // Z 판정 범위 넓힘
+      if(cz>PLAYER_Z-2.0&&cz<PLAYER_Z+1.2){
+        const hp=n.type==='left'?h.left:h.right;
+        const hv=n.type==='left'?h.leftVelocity:h.rightVelocity;
+        if(hp){
+          vA.set(LANE_X[n.lineIndex],LAYER_Y[n.lineLayer],cz);
+          // XY 히트 반경: 1.1 (넓게)
+          const dx=hp.x-vA.x, dy=hp.y-vA.y;
+          if(Math.sqrt(dx*dx+dy*dy)<1.1){
+            n.hit=true; n.hitTime=time;
+            shk.current=0.15;
+            onNoteHit(n,hv.length()>=0.8);
+            anRef.current.splice(i,1);bump();
+          }
+        }
+      }
+    }
+
+    // 장애물 충돌
+    if(obsCool.current>0)obsCool.current-=dt;
+    for(let i=aoRef.current.length-1;i>=0;i--){
+      const o=aoRef.current[i];if(o.hit)continue;
+      const cz=PLAYER_Z-(o.time-time)*NOTE_SPEED;
+      if(cz>MISS_Z+3){aoRef.current.splice(i,1);continue;}
+      if(cz>PLAYER_Z-2.5&&cz<PLAYER_Z+1.2&&hd.detected&&obsCool.current<=0){
+        const hit=o.obstacleType==='top'?hd.y<0.40
+                 :o.obstacleType==='left'?hd.x<0.40
+                 :hd.x>0.60;
+        if(hit){o.hit=true;obsCool.current=2.5;shk.current=0.8;onObstacleHit();aoRef.current.splice(i,1);}
+      }
+    }
+  });
+
+  const visNotes=useMemo(()=>
+    notesRef.current.filter(n=>!n.missed&&(!n.hit||(ct-(n.hitTime??0))<0.45)&&n.time-ct<5.5&&n.time-ct>-2)
+  ,[tick,ct]);
+  const visObs=useMemo(()=>
+    obsRef.current.filter(o=>!o.hit&&o.time-ct<5.5&&o.time-ct>-1)
+  ,[tick,ct]);
+
+  const lp=useRef(null),rp=useRef(null),lv=useRef(null),rv=useRef(null);
+  useFrame(()=>{
+    lp.current=handPositionsRef.current.left;
+    rp.current=handPositionsRef.current.right;
+    lv.current=handPositionsRef.current.leftVelocity;
+    rv.current=handPositionsRef.current.rightVelocity;
+  });
+
+  return(
+    <>
+      <PerspectiveCamera ref={camRef} makeDefault position={[0,1.8,4]} fov={65}/>
+      <color attach="background" args={['#06060a']}/>
+      <fog   attach="fog"        args={['#06060a',14,50]}/>
+      <ambientLight ref={ambRef} intensity={0.12}/>
+      <spotLight ref={spotRef} position={[0,8,4]} angle={0.65} penumbra={1} intensity={0.7} castShadow={false}/>
+      <Grid position={[0,0,0]} args={[6,80]}
+        cellThickness={0.07} cellColor="#1a1a2e"
+        sectionSize={4} sectionThickness={1.2} sectionColor="#1e3a8a"
+        fadeDistance={48} infiniteGrid/>
+      <mesh rotation={[-Math.PI/2,0,0]} position={[0,-0.01,0]}>
+        <planeGeometry args={[4,80]}/>
+        <meshStandardMaterial color="#09090f" roughness={1} metalness={0}/>
+      </mesh>
+      <Stars radius={40} depth={40} count={600} factor={3} saturation={0} fade speed={0.4}/>
+      <Saber type="left"  posRef={lp} velRef={lv}/>
+      <Saber type="right" posRef={rp} velRef={rv}/>
+      {visNotes.map(n=>(
+        <NoteComp key={n.id} data={n}
+          zPos={PLAYER_Z-(n.time-ct)*NOTE_SPEED}
+          currentTime={ct} mult={mult}/>
+      ))}
+      {visObs.map(o=>(
+        <ObsComp key={o.id} data={o} zPos={PLAYER_Z-(o.time-ct)*NOTE_SPEED}/>
+      ))}
+    </>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// UI 컴포넌트
+// ══════════════════════════════════════════════════════
+function Hearts({count}){
+  return(
+    <div style={{display:'flex',gap:4}}>
+      {Array.from({length:MAX_HEARTS}).map((_,i)=>(
+        <svg key={i} viewBox="0 0 24 24"
+          style={{width:'clamp(24px,5vw,34px)',height:'clamp(24px,5vw,34px)',
+            transition:'all .2s',opacity:i<count?1:.2,
+            transform:i<count?'scale(1.1)':'scale(0.9)',
+            filter:i<count?'drop-shadow(0 0 6px #ec4899)':'none'}}
+          fill={i<count?'#ec4899':'#4b5563'}>
+          <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+        </svg>
+      ))}
+    </div>
+  );
+}
+
+function ObsWarn({type}){
+  if(!type)return null;
+  const MAP={
+    top:  {t:'⬇️ 머리 숙여!',  s:{top:'12%',left:'50%',transform:'translateX(-50%)'}},
+    left: {t:'➡️ 오른쪽으로!', s:{top:'46%',left:'2%',transform:'translateY(-50%)'}},
+    right:{t:'⬅️ 왼쪽으로!',  s:{top:'46%',right:'2%',transform:'translateY(-50%)'}},
+  };
+  const{t,s}=MAP[type];
+  return(
+    <div style={{position:'absolute',...s,zIndex:25,pointerEvents:'none'}}>
+      <div style={{background:'rgba(234,88,12,.92)',color:'#fff',
+        fontSize:'clamp(14px,3.5vw,21px)',fontWeight:900,
+        padding:'9px 18px',borderRadius:12,border:'3px solid #fed7aa',
+        boxShadow:'0 0 22px rgba(255,100,0,.7)',
+        animation:'warnpulse .45s ease-in-out infinite',whiteSpace:'nowrap'}}>
+        {t}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════
+// App
+// ══════════════════════════════════════════════════════
+function App(){
+  const[gs,setGs]=useState(GS.LOADING);
+  const[score,setScore]=useState(0);
+  const[combo,setCombo]=useState(0);
+  const[hearts,setHearts]=useState(MAX_HEARTS);
+  const[mult,setMult]=useState(5);
+  const[obsW,setObsW]=useState(null);
+  const[flash,setFlash]=useState(false);
+  const[hitMsg,setHitMsg]=useState(null);
+  const[gameNotes,setGameNotes]=useState([]);
+  const[gameObs,setGameObs]=useState([]);
+
+  const audioRef=useRef(new Audio(SONG_URL));
+  const videoRef=useRef(null);
+  const comboRef=useRef(0), multRef=useRef(5);
+
+  const{isCameraReady,handPositionsRef,headPositionRef,lastResultsRef,error:camErr}=useMediaPipe(videoRef);
+
+  useEffect(()=>{comboRef.current=combo;},[combo]);
+  useEffect(()=>{multRef.current=mult;},[mult]);
+
+  const showMsg=useCallback((text,color)=>{
+    setHitMsg({text,color});setTimeout(()=>setHitMsg(null),950);
+  },[]);
+
+  const doDamage=useCallback(()=>{
+    setFlash(true);setTimeout(()=>setFlash(false),300);
+    setHearts(h=>{
+      if(h<=1){setTimeout(()=>{setGs(GS.GAME_OVER);audioRef.current?.pause();},60);return 0;}
+      return h-1;
+    });
+  },[]);
+
+  const onHit=useCallback((note,good)=>{
+    if(navigator.vibrate)navigator.vibrate(good?40:15);
+    if(note.noteType==='heart'){
+      setHearts(h=>Math.min(MAX_HEARTS,h+1));
+      showMsg('💖 +1 라이프!','#ec4899');
+      setScore(s=>s+300);setCombo(c=>c+1);return;
+    }
+    const m=multRef.current, ok=note.numVal%m===0;
+    if(ok){
+      const pts=200*(comboRef.current>10?2:1);
+      setScore(s=>s+pts);setCombo(c=>c+1);
+      showMsg(`✓ ${note.numVal} = ${m}의 배수! +${pts}`,'#f59e0b');
+    }else{
+      setCombo(0);
+      showMsg(`✗ ${note.numVal}은 ${m}의 배수 아님`,'#ef4444');
+      doDamage();
+    }
+  },[showMsg,doDamage]);
+
+  const onMiss=useCallback((note)=>{
+    setCombo(0);
+    if(note.noteType==='heart'){doDamage();return;}
+    if(note.numVal%multRef.current===0)doDamage();
+  },[doDamage]);
+
+  const onObsHit=useCallback(()=>{
+    setCombo(0);showMsg('💥 장애물 충돌!','#ff6600');doDamage();
+  },[doDamage,showMsg]);
+
+  const onMultChange=useCallback(m=>{
+    setMult(m);multRef.current=m;
+    setGameNotes(prev=>prev.map(n=>
+      (n.noteType==='note'&&!n.hit&&!n.missed)
+        ?{...n,numVal:Math.random()<0.65?mulOf(m):nonMulOf(m)}:n
+    ));
+  },[]);
+
+  const startGame=useCallback(async()=>{
+    if(!isCameraReady)return;
+    const m=MULT_OPTS[Math.floor(Math.random()*MULT_OPTS.length)];
+    setMult(m);multRef.current=m;
+    setScore(0);setCombo(0);comboRef.current=0;
+    setHearts(MAX_HEARTS);setObsW(null);setHitMsg(null);
+    const fc=freshChart(m);
+    setGameNotes(fc.notes);setGameObs(fc.obstacles);
+    try{
+      audioRef.current.currentTime=0;
+      await audioRef.current.play();
+      setGs(GS.PLAYING);
+    }catch(e){alert('오디오 재생 실패. 먼저 화면을 클릭해주세요.');}
+  },[isCameraReady]);
+
+  useEffect(()=>{if(gs===GS.LOADING&&isCameraReady)setGs(GS.IDLE);},[isCameraReady,gs]);
+
+  useEffect(()=>{
+    if(gs!==GS.PLAYING)return;
+    const iv=setInterval(()=>{
+      const t=audioRef.current?.currentTime??0;
+      const u=gameObs.find(o=>!o.hit&&o.time-t>0&&o.time-t<2.5);
+      setObsW(u?u.obstacleType:null);
+    },100);
+    return()=>clearInterval(iv);
+  },[gs,gameObs]);
+
+  // ── 반응형 패널
+  const panel=(ch,ex={})=>(
+    <div style={{background:'rgba(4,4,8,.93)',borderRadius:18,
+      border:'2px solid rgba(59,130,246,.2)',
+      padding:'clamp(20px,4vw,36px) clamp(20px,5vw,38px)',
+      textAlign:'center',backdropFilter:'blur(16px)',
+      width:'clamp(300px,90vw,450px)',...ex}}>
+      {ch}
+    </div>
+  );
+
+  const fs=(base,min=10,max=999)=>({fontSize:`clamp(${min}px,${base},${max}px)`});
+
+  return(
+    <div style={{position:'relative',width:'100%',height:'100vh',background:'#000',overflow:'hidden'}}>
+
+      <video ref={videoRef} style={{position:'absolute',opacity:0,pointerEvents:'none',width:640,height:480}} playsInline muted autoPlay/>
+
+      {flash&&<div style={{position:'absolute',inset:0,background:'rgba(220,38,38,.45)',
+        zIndex:60,pointerEvents:'none',animation:'dmgflash .3s ease-out forwards'}}/>}
+
+      <Canvas frameloop="always" dpr={[1,Math.min(window.devicePixelRatio,1.5)]}
+        gl={{antialias:true,powerPreference:'high-performance'}} shadows={false}>
+        {gs===GS.PLAYING&&gameNotes.length>0&&
+          <GameScene
+            gameStatus={gs} audioRef={audioRef}
+            handPositionsRef={handPositionsRef} headPositionRef={headPositionRef}
+            notes={gameNotes} obstacles={gameObs} mult={mult}
+            onNoteHit={onHit} onNoteMiss={onMiss}
+            onObstacleHit={onObsHit}
+            onSongEnd={()=>{setGs(GS.VICTORY);audioRef.current?.pause();}}
+            onMultChange={onMultChange}
+          />
+        }
+      </Canvas>
+
+      <WebcamPreview videoRef={videoRef} resultsRef={lastResultsRef} isCameraReady={isCameraReady}/>
+      <ObsWarn type={obsW}/>
+
+      {hitMsg&&(
+        <div style={{position:'absolute',top:'30%',left:'50%',zIndex:35,pointerEvents:'none',
+          fontWeight:900,letterSpacing:1,whiteSpace:'nowrap',
+          color:hitMsg.color,textShadow:`0 0 14px ${hitMsg.color}`,
+          animation:'msgpop .95s ease-out forwards',
+          ...fs('3.5vw',15,22)}}>
+          {hitMsg.text}
+        </div>
+      )}
+
+      {/* HUD — 게임 중 */}
+      {gs===GS.PLAYING&&(
+        <div style={{position:'absolute',top:0,left:0,right:0,
+          padding:'clamp(10px,2vw,18px) clamp(12px,2.5vw,22px)',
+          display:'flex',justifyContent:'space-between',alignItems:'flex-start',
+          pointerEvents:'none',zIndex:10}}>
+
+          {/* 좌: 하트 */}
+          <div>
+            <Hearts count={hearts}/>
+            <div style={{color:'#9ca3af',...fs('2vw',10,13),marginTop:3}}>라이프</div>
+          </div>
+
+          {/* 중: 점수+콤보+배수 */}
+          <div style={{textAlign:'center'}}>
+            <div style={{fontWeight:700,color:'#fff',lineHeight:1,
+              textShadow:'0 0 10px rgba(59,130,246,.7)',...fs('5vw',24,46)}}>
+              {score.toLocaleString()}
+            </div>
+            <div style={{fontWeight:700,marginTop:2,color:combo>10?'#60a5fa':'#d1d5db',...fs('3vw',14,20)}}>
+              {combo}x COMBO
+            </div>
+            <div style={{marginTop:6,background:'rgba(120,53,15,.82)',border:'2px solid #d97706',
+              borderRadius:9,padding:'5px 11px',display:'inline-block'}}>
+              <div style={{color:'#fcd34d',fontWeight:700,letterSpacing:2,marginBottom:2,...fs('1.8vw',9,11)}}>
+                지금 때릴 숫자
+              </div>
+              <div style={{color:'#fef3c7',fontWeight:900,...fs('3vw',14,18)}}>
+                <span style={{color:'#fbbf24',...fs('4vw',20,26)}}>{mult}</span>의 배수
+              </div>
+              <div style={{color:'rgba(251,191,36,.5)',marginTop:1,...fs('1.8vw',9,11)}}>
+                예: {mult*2}, {mult*3}, {mult*5}…
+              </div>
+            </div>
+          </div>
+
+          {/* 우: 머리 추적 */}
+          <div style={{color:'#9ca3af',background:'rgba(0,0,0,.5)',
+            padding:'5px 9px',borderRadius:7,border:'1px solid #374151',
+            display:'flex',alignItems:'center',gap:5,marginTop:3,...fs('1.8vw',10,12)}}>
+            <div style={{width:7,height:7,borderRadius:'50%',flexShrink:0,
+              background:headPositionRef?.current?.detected?'#4ade80':'#f87171'}}/>
+            머리 추적
+          </div>
+        </div>
+      )}
+
+      {/* 메뉴 */}
+      <div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',
+        justifyContent:'center',zIndex:10,pointerEvents:gs===GS.LOADING?'none':'auto'}}>
+
+        {gs===GS.LOADING&&(
+          <div style={{background:'rgba(0,0,0,.85)',padding:'clamp(24px,5vw,38px)',borderRadius:16,
+            display:'flex',flexDirection:'column',alignItems:'center',
+            border:'1px solid rgba(30,58,138,.4)',gap:14,width:'clamp(280px,80vw,380px)'}}>
+            <div style={{width:52,height:52,border:'4px solid transparent',
+              borderTopColor:'#3b82f6',borderBottomColor:'#3b82f6',
+              borderRadius:'50%',animation:'spin 1s linear infinite'}}/>
+            <h2 style={{color:'#fff',fontWeight:700,...fs('4vw',17,21)}}>MathAttack 로딩 중</h2>
+            <p style={{color:'#93c5fd',textAlign:'center',lineHeight:1.7,...fs('2.5vw',11,13)}}>
+              {!isCameraReady?'AI 모델 + 카메라 초기화 중…\n첫 로딩은 30초~1분 소요':'에셋 로딩 중…'}
+            </p>
+            {camErr&&<p style={{color:'#f87171',textAlign:'center',...fs('2.2vw',10,12)}}>{camErr}</p>}
+          </div>
+        )}
+
+        {gs===GS.IDLE&&panel(<>
+          <div style={{fontSize:'clamp(32px,8vw,44px)',marginBottom:4}}>🧮</div>
+          <h1 style={{color:'#fff',fontStyle:'italic',letterSpacing:-2,marginBottom:2,
+            textShadow:'0 0 24px rgba(59,130,246,.6)',lineHeight:1,...fs('9vw',28,48)}}>
+            MATH <span style={{color:'#3b82f6'}}>ATTACK</span>
+          </h1>
+          <p style={{color:'#fbbf24',fontWeight:700,letterSpacing:3,marginBottom:14,...fs('2.5vw',11,14)}}>
+            메스어택 — 수학 공격
+          </p>
+          <div style={{background:'rgba(255,255,255,.04)',borderRadius:9,padding:'11px 13px',
+            border:'1px solid rgba(255,255,255,.08)',textAlign:'left',marginBottom:14,
+            color:'#d1d5db',lineHeight:1.9,...fs('2.5vw',11,13)}}>
+            <div>🟡 <b style={{color:'#f59e0b'}}>금색 판</b> = 배수 정답 → 반드시 타격!</div>
+            <div><span style={{color:'#ef4444'}}>■</span> 빨강 = 왼손 &nbsp;|&nbsp; <span style={{color:'#3b82f6'}}>■</span> 파랑 = 오른손</div>
+            <div>💖 분홍 판 ♥ = 때리면 라이프 +1</div>
+            <div>⚠️ <b style={{color:'#f97316'}}>장애물</b> = 경고 방향으로 머리 회피</div>
+            <div style={{color:'#6b7280',marginTop:2,...fs('2vw',9,11)}}>
+              오답 타격·정답 놓침·장애물 = ❤️ -1 | 0개 = 게임 오버
+            </div>
+          </div>
+          {!isCameraReady
+            ?<div style={{color:'#f87171',background:'rgba(127,29,29,.3)',padding:10,borderRadius:7,...fs('2.5vw',11,13)}}>
+              📷 카메라 준비 중…
+            </div>
+            :<button onClick={startGame} style={{background:'#2563eb',color:'#fff',fontWeight:700,
+              padding:'13px 38px',borderRadius:999,border:'none',cursor:'pointer',
+              display:'flex',alignItems:'center',gap:8,margin:'0 auto',
+              boxShadow:'0 0 20px rgba(37,99,235,.5)',...fs('3.5vw',15,18)}}>
+              ▶ 게임 시작
+            </button>
+          }
+        </>)}
+
+        {(gs===GS.GAME_OVER||gs===GS.VICTORY)&&panel(<>
+          <h2 style={{fontWeight:700,marginBottom:10,
+            color:gs===GS.VICTORY?'#4ade80':'#f87171',...fs('8vw',28,46)}}>
+            {gs===GS.VICTORY?'🎉 클리어!':'💀 게임 오버'}
+          </h2>
+          <p style={{color:'#aaa',marginBottom:3,...fs('3vw',13,16)}}>최종 점수</p>
+          <p style={{fontWeight:900,color:'#60a5fa',marginBottom:22,...fs('8vw',30,46)}}>{score.toLocaleString()}</p>
+          <button onClick={startGame} style={{background:'rgba(255,255,255,.1)',color:'#fff',
+            padding:'11px 26px',borderRadius:999,border:'1px solid rgba(255,255,255,.2)',
+            cursor:'pointer',display:'flex',alignItems:'center',gap:7,margin:'0 auto',...fs('3.5vw',14,17)}}>
+            🔄 다시 플레이
+          </button>
+        </>)}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
 </body>
 </html>
