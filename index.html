@@ -76,13 +76,64 @@ function generateChart(){
   const notes=[],obs=[];let id=0,oi=0;
   const aL=[0,1,2],aLn=[0,1,2,3],lLn=[0,1],rLn=[2,3];
   const mk=(type,li,ll,t)=>({id:`n${id++}`,time:t,lineIndex:li,lineLayer:ll,type,noteType:'note',numVal:0,hit:false,missed:false,hitTime:undefined});
-  for(let i=8;i<70;i+=8){const t=i*BEAT;notes.push(i%16===0?mk('left',rnd(lLn),rnd(aL),t):mk('right',rnd(rLn),rnd(aL),t));}
-  for(let i=70;i<129;i+=4){const t=i*BEAT;if(i%8===0){notes.push(mk('left',rnd(lLn),rnd(aL),t));notes.push(mk('right',rnd(rLn),rnd(aL),t));}else notes.push(mk(i%8===4?'left':'right',rnd(aLn),rnd(aL),t));}
-  for(let i=129;i<175;i+=2){const t=i*BEAT;if(i%8===0){notes.push(mk('left',rnd(lLn),rnd(aL),t));notes.push(mk('right',rnd(rLn),rnd(aL),t));}else notes.push(mk(i%4===0?'left':'right',rnd(aLn),rnd(aL),t));}
-  for(let i=175;i<220;i+=2){const t=i*BEAT;if(i%8===0){[0,1].forEach(li=>notes.push(mk('left',li,[0,2][li],t)));[2,3].forEach(li=>notes.push(mk('right',li,[0,2][li-2],t)));}else if(i%4===0){notes.push(mk('left',rnd(lLn),rnd(aL),t));notes.push(mk('right',rnd(rLn),rnd(aL),t));}else notes.push(mk(rnd(['left','right']),rnd(aLn),rnd(aL),t));}
-  for(let i=80;i<220;i+=32)notes.push({id:`h${id++}`,time:i*BEAT,lineIndex:rnd([1,2]),lineLayer:1,type:rnd(['left','right']),noteType:'heart',numVal:0,hit:false,missed:false,hitTime:undefined});
+  const mkH=(li,ll,t)=>({id:`h${id++}`,time:t,lineIndex:li,lineLayer:ll,type:rnd(['left','right']),noteType:'heart',numVal:0,hit:false,missed:false,hitTime:undefined});
+
+  // ── 난이도 1 (0~30s): 8박자마다 1개 ──
+  for(let i=8;i<70;i+=8){
+    const t=i*BEAT;
+    notes.push(i%16===0?mk('left',rnd(lLn),rnd(aL),t):mk('right',rnd(rLn),rnd(aL),t));
+  }
+
+  // ── 난이도 2 (30~60s): 4박자마다, 가끔 양손 ──
+  for(let i=70;i<129;i+=4){
+    const t=i*BEAT;
+    if(i%8===0){notes.push(mk('left',rnd(lLn),rnd(aL),t));notes.push(mk('right',rnd(rLn),rnd(aL),t));}
+    else notes.push(mk(i%8===4?'left':'right',rnd(aLn),rnd(aL),t));
+  }
+
+  // ── 난이도 3 (60~90s): 2박자마다 + 층 다양화 ──
+  for(let i=129;i<175;i+=2){
+    const t=i*BEAT;
+    if(i%6===0){notes.push(mk('left',rnd(lLn),rnd(aL),t));notes.push(mk('right',rnd(rLn),rnd(aL),t));}
+    else notes.push(mk(i%4===0?'left':'right',rnd(aLn),rnd(aL),t));
+  }
+
+  // ── 난이도 4 (90~120s): 더 빠르게 + 3연타 ──
+  for(let i=175;i<230;i+=2){
+    const t=i*BEAT;
+    if(i%8===0){
+      [0,1].forEach(li=>notes.push(mk('left',li,[0,2][li],t)));
+      [2,3].forEach(li=>notes.push(mk('right',li,[0,2][li-2],t)));
+    }else if(i%4===0){
+      notes.push(mk('left',rnd(lLn),rnd(aL),t));
+      notes.push(mk('right',rnd(rLn),rnd(aL),t));
+    }else{
+      notes.push(mk(rnd(['left','right']),rnd(aLn),rnd(aL),t));
+    }
+  }
+
+  // ── 난이도 5 (120s~): 고밀도 4방향 폭격 ──
+  for(let i=230;i<290;i+=1){
+    const t=i*BEAT;
+    if(i%4===0){
+      // 4방향 동시
+      notes.push(mk('left',0,rnd(aL),t));
+      notes.push(mk('left',1,rnd(aL),t));
+      notes.push(mk('right',2,rnd(aL),t));
+      notes.push(mk('right',3,rnd(aL),t));
+    }else if(i%2===0){
+      notes.push(mk('left',rnd(lLn),rnd(aL),t));
+      notes.push(mk('right',rnd(rLn),rnd(aL),t));
+    }else{
+      notes.push(mk(rnd(['left','right']),rnd(aLn),rnd(aL),t));
+    }
+  }
+
+  // 하트: 각 난이도 구간에 배치
+  for(let i=80;i<290;i+=28)notes.push(mkH(rnd([1,2]),1,i*BEAT));
+
   const ot=['top','left','right'];
-  for(let i=80;i<220;i+=20)obs.push({id:`o${oi++}`,time:i*BEAT,obstacleType:ot[Math.floor(i/20)%3],hit:false});
+  for(let i=80;i<290;i+=18)obs.push({id:`o${oi++}`,time:i*BEAT,obstacleType:ot[Math.floor(i/18)%3],hit:false});
   return{notes:notes.sort((a,b)=>a.time-b.time),obstacles:obs.sort((a,b)=>a.time-b.time)};
 }
 
@@ -112,9 +163,14 @@ function useMediaPipe(videoRef){
   const hlRef=useRef(null),fdRef=useRef(null),rafRef=useRef(0);
 
   const toWorld=(x,y)=>{
-    const wx=(0.5-x)*6.2;
-    const wy=(1-y)*4.5-2.25+1.0;
-    return new THREE.Vector3(wx,Math.max(0.1,wy),0);
+    // 모바일/PC 모두 손이 화면 전체를 커버하도록 넓은 범위 매핑
+    const isMobile=window.innerWidth<window.innerHeight;
+    const xScale=isMobile?8.5:9.0;
+    const yScale=isMobile?5.5:5.2;
+    const yOff =isMobile?-1.6:-1.8;
+    const wx=(0.5-x)*xScale;
+    const wy=(1-y)*yScale+yOff;
+    return new THREE.Vector3(wx,Math.max(-0.5,wy),0);
   };
 
   useEffect(()=>{
@@ -181,26 +237,32 @@ function useMediaPipe(videoRef){
       const dt=Math.max(0.001,(now-s.lastTs)/1000);
       s.lastTs=now;
       let nL=null,nR=null;
+      const isMobile=window.innerWidth<window.innerHeight;
+      const xScale=isMobile?8.5:9.0;
+      const yScale=isMobile?5.5:5.2;
+      const yOff=isMobile?-1.6:-1.8;
       if(hr.landmarks?.length>0){
         for(let i=0;i<hr.landmarks.length;i++){
           const lm=hr.landmarks[i];
-          // 미러 보정
           const isRight=hr.handedness[i][0].categoryName==='Left';
+          // 손 중심: 손목+검지뿌리+새끼뿌리 평균
           const cx=(lm[0].x+lm[5].x+lm[17].x)/3;
           const cy=(lm[0].y+lm[5].y+lm[17].y)/3;
-          const pos=toWorld(cx,cy);
-          const wx0=(0.5-lm[0].x)*6.2,wy0=(1-lm[0].y)*4.5-2.25+1;
-          const wx12=(0.5-lm[12].x)*6.2,wy12=(1-lm[12].y)*4.5-2.25+1;
-          const dir=new THREE.Vector3(wx12-wx0,wy12-wy0,-0.4).normalize();
+          const wx=(0.5-cx)*xScale;
+          const wy=(1-cy)*yScale+yOff;
+          const pos=new THREE.Vector3(wx,Math.max(-0.5,wy),0);
+          // 광선검 방향: 손목→중지끝
+          const wx0=(0.5-lm[0].x)*xScale,wy0=(1-lm[0].y)*yScale+yOff;
+          const wx12=(0.5-lm[12].x)*xScale,wy12=(1-lm[12].y)*yScale+yOff;
+          const dir=new THREE.Vector3(wx12-wx0,wy12-wy0,-0.3).normalize();
           if(isRight)nR={pos,dir};else nL={pos,dir};
         }
       }
-      const LERP=0.72;
-      const GRACE_FRAMES=12; // ~200ms at 60fps
+      const LERP=0.68;
+      const GRACE_FRAMES=15;
       const grace=graceRef.current;
       const smooth=(prev,next,side)=>{
         if(!next){
-          // 손이 안보임: grace period 동안 마지막 위치 유지
           if(prev&&grace[side]<GRACE_FRAMES){grace[side]++;return prev;}
           grace[side]=0;return null;
         }
@@ -349,52 +411,70 @@ function HitEffect({color,tsh,isGood,isPenalty}){
 }
 
 // ══════════════════════════════════════
-// SliceEffect - 두동강 이펙트
+// SliceEffect - 물리 기반 두동강 이펙트
 // ══════════════════════════════════════
-function SliceEffect({color,edgeCol,startPos,noteType,isHeart}){
-  const topRef=useRef(),botRef=useRef();
-  const t=useRef(0);
-  const done=useRef(false);
-  const bodyCol=noteType==='left'?'#3d0f0f':'#0d1a3d';
+function SliceEffect({color,edgeCol,startPos,noteType}){
+  const topRef=useRef(),botRef=useRef(),lineRef=useRef();
+  // 물리 상태: position, velocity, angularVelocity, opacity
+  const phys=useRef({
+    top:{vx:(noteType==='left'?-1.8:1.8)+(Math.random()-0.5)*0.8, vy:2.2+Math.random()*0.8, va:(noteType==='left'?-2.5:2.5)+Math.random()*1.0, rx:0, ry:0},
+    bot:{vx:(noteType==='left'? 1.4:-1.4)+(Math.random()-0.5)*0.8, vy:-0.5-Math.random()*0.5, va:(noteType==='left'? 2.0:-2.0)+Math.random()*1.0, rx:0, ry:0},
+    t:0, alive:true
+  });
+  const GRAVITY=-9.8;
+  const LIFE=1.4; // 시야 밖 나가면 소멸
 
   useFrame((_,dt)=>{
-    if(done.current)return;
-    t.current+=dt;
-    const p=Math.min(t.current/0.9,1);
-    // 위 조각: 위로 살짝 튀었다가 아래로
+    const p=phys.current;
+    if(!p.alive)return;
+    p.t+=dt;
+    if(p.t>LIFE){p.alive=false;if(topRef.current)topRef.current.visible=false;if(botRef.current)botRef.current.visible=false;if(lineRef.current)lineRef.current.visible=false;return;}
+
+    const fade=Math.max(0,1-p.t/LIFE);
+    // 위 조각
     if(topRef.current){
-      topRef.current.position.y=PH*0.27+Math.sin(p*Math.PI)*0.3-p*p*4.5;
-      topRef.current.position.x=(noteType==='left'?-1:1)*p*0.4;
-      topRef.current.rotation.z=(noteType==='left'?-1:1)*p*1.1;
-      topRef.current.material.opacity=Math.max(0,1-p*1.2);
+      p.top.vy+=GRAVITY*dt;
+      p.top.rx+=p.top.va*dt;
+      p.top.ry+=(noteType==='left'?1.2:-1.2)*dt;
+      const py=PH*0.27+p.top.vy*(p.t)-0.5*Math.abs(GRAVITY)*p.t*p.t*0.5;
+      const px=p.top.vx*p.t;
+      topRef.current.position.set(px,py,(noteType==='left'?0.1:-0.1)*p.t);
+      topRef.current.rotation.set(p.top.ry*0.5,p.top.ry,p.top.rx);
+      topRef.current.material.opacity=fade*0.95;
+      // 시야 밖(y < -6 또는 |x| > 7)이면 바로 소멸
+      if(topRef.current.position.y<-6||Math.abs(topRef.current.position.x)>7)p.alive=false;
     }
-    // 아래 조각: 아래로 바로 낙하
+    // 아래 조각
     if(botRef.current){
-      botRef.current.position.y=-PH*0.27-p*p*4.0;
-      botRef.current.position.x=(noteType==='left'?1:-1)*p*0.3;
-      botRef.current.rotation.z=(noteType==='left'?1:-1)*p*0.8;
-      botRef.current.material.opacity=Math.max(0,1-p*1.2);
+      p.bot.vy+=GRAVITY*dt;
+      p.bot.rx+=p.bot.va*dt;
+      p.bot.ry+=(noteType==='left'?-1.0:1.0)*dt;
+      const py2=-PH*0.27+p.bot.vy*(p.t)-0.5*Math.abs(GRAVITY)*p.t*p.t*0.5;
+      const px2=p.bot.vx*p.t;
+      botRef.current.position.set(px2,py2,(noteType==='left'?-0.1:0.1)*p.t);
+      botRef.current.rotation.set(p.bot.ry*0.5,p.bot.ry,p.bot.rx);
+      botRef.current.material.opacity=fade*0.95;
     }
-    if(p>=1)done.current=true;
+    // 절단선 페이드
+    if(lineRef.current)lineRef.current.material.opacity=Math.max(0,fade*2.5-1.5);
   });
 
   const sliceH=PH*0.5;
+  const bodyCol=noteType==='left'?'#3d0f0f':'#0d1a3d';
   return(
-    <group position={[startPos.x,startPos.y,startPos.z]}>
-      {/* 위 반쪽 */}
+    <group>
       <mesh ref={topRef} position={[0,PH*0.27,0]}>
         <boxGeometry args={[PW,sliceH,PD]}/>
-        <meshStandardMaterial color={bodyCol} emissive={color} emissiveIntensity={0.4} transparent opacity={1}/>
+        <meshStandardMaterial color={bodyCol} emissive={color} emissiveIntensity={0.55} transparent opacity={0.9}/>
       </mesh>
-      {/* 아래 반쪽 */}
       <mesh ref={botRef} position={[0,-PH*0.27,0]}>
         <boxGeometry args={[PW,sliceH,PD]}/>
-        <meshStandardMaterial color={bodyCol} emissive={color} emissiveIntensity={0.4} transparent opacity={1}/>
+        <meshStandardMaterial color={bodyCol} emissive={color} emissiveIntensity={0.55} transparent opacity={0.9}/>
       </mesh>
-      {/* 절단면 빛 */}
-      <mesh position={[0,0,PD/2+0.01]}>
-        <planeGeometry args={[PW,0.055]}/>
-        <meshBasicMaterial color="white" toneMapped={false} transparent opacity={0.95}/>
+      {/* 절단면 빛줄기 */}
+      <mesh ref={lineRef} position={[0,0,PD/2+0.012]}>
+        <planeGeometry args={[PW,0.06]}/>
+        <meshBasicMaterial color="white" toneMapped={false} transparent opacity={1}/>
       </mesh>
     </group>
   );
@@ -412,48 +492,74 @@ function NoteComp({data,zPos,currentTime,multRef}){
   const isCorrect=!isHeart&&data.numVal!==0&&data.numVal%mult===0;
   const noteColor=data.type==='left'?COL.left:COL.right;
   const edgeCol=isCorrect?COL.correct:noteColor;
-  const bodyCol=data.type==='left'?'#3d0f0f':'#0d1a3d';
 
   const pos=useMemo(()=>[LANE_X[data.lineIndex],LAYER_Y[data.lineLayer],zPos],[data.lineIndex,data.lineLayer,zPos]);
   if(data.missed)return null;
   if(data.hit&&data.hitTime!=null){
     const tsh=currentTime-data.hitTime;
-    const showSlice=tsh<0.9&&!isHeart;
+    const showSlice=tsh<1.1&&!isHeart;
     const showHitFx=tsh<(isCorrect||isHeart?0.85:0.52);
-    const hitPos=new THREE.Vector3(pos[0],pos[1],pos[2]);
     return<group position={pos}>
-      {showSlice&&<SliceEffect color={noteColor} edgeCol={edgeCol} startPos={new THREE.Vector3(0,0,0)} noteType={data.type} isHeart={isHeart}/>}
+      {showSlice&&<SliceEffect color={noteColor} edgeCol={edgeCol} startPos={new THREE.Vector3(0,0,0)} noteType={data.type}/>}
       {showHitFx&&<HitEffect color={edgeCol} tsh={tsh} isGood={isCorrect||isHeart} isPenalty={data.isPenalty}/>}
     </group>;
   }
 
+  if(isHeart){
+    // 하트: 순수 핑크 빛나는 하트만
+    return(
+      <group position={pos}>
+        <mesh geometry={panelGeo}>
+          <meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6}
+            emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>
+        </mesh>
+        <Text position={[0,0,PD/2+0.02]} fontSize={PH*0.65} color="#ff6eb4" anchorX="center" anchorY="middle"
+          outlineColor="#ec4899" outlineWidth={0.018}>♥</Text>
+        <lineSegments geometry={edgesGeo}>
+          <lineBasicMaterial color="#ec4899" toneMapped={false}/>
+        </lineSegments>
+        <pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>
+      </group>
+    );
+  }
+
   return(
     <group position={pos}>
+      {/* 유리질 반투명 패널 */}
       <mesh geometry={panelGeo}>
-        <meshStandardMaterial color={bodyCol} roughness={0.3} metalness={0.5} emissive={noteColor} emissiveIntensity={0.18}/>
+        <meshStandardMaterial
+          color={noteColor} roughness={0.05} metalness={0.15}
+          emissive={noteColor} emissiveIntensity={0.22}
+          transparent opacity={0.38}/>
       </mesh>
-      <mesh position={[0,0,PD/2+0.003]}>
-        <planeGeometry args={[PW*0.9,PH*0.9]}/>
-        <meshBasicMaterial color={noteColor} transparent opacity={0.3}/>
+      {/* 앞면 광택 레이어 */}
+      <mesh position={[0,0,PD/2+0.002]}>
+        <planeGeometry args={[PW*0.92,PH*0.92]}/>
+        <meshBasicMaterial color="white" transparent opacity={0.07}/>
       </mesh>
-      {isHeart
-        ?<Text position={[0,0,PD/2+0.018]} fontSize={PH*0.6} color="#fff" anchorX="center" anchorY="middle">♥</Text>
-        :<Text position={[0,0,PD/2+0.018]} fontSize={PH*0.5} color="#fff" anchorX="center" anchorY="middle"
-            outlineColor={edgeCol} outlineWidth={0.025}>{data.numVal}</Text>
-      }
+      {/* 숫자 */}
+      <Text position={[0,0,PD/2+0.022]} fontSize={PH*0.52} color="#ffffff" anchorX="center" anchorY="middle"
+          outlineColor={edgeCol} outlineWidth={isCorrect?0.04:0.022}>{data.numVal}</Text>
+      {/* 테두리 엣지 */}
       <lineSegments geometry={edgesGeo}>
         <lineBasicMaterial color={edgeCol} toneMapped={false}/>
       </lineSegments>
-      {isCorrect&&<mesh rotation={[Math.PI/2,0,0]}>
-        <torusGeometry args={[PW*0.6,0.026,6,20]}/>
-        <meshBasicMaterial color={COL.correct} toneMapped={false}/>
-      </mesh>}
+      {/* 정답: 반짝이는 코너 점 4개 (가로선 제거) */}
+      {isCorrect&&<>
+        {[[-PW*0.42,-PH*0.42],[PW*0.42,-PH*0.42],[-PW*0.42,PH*0.42],[PW*0.42,PH*0.42]].map(([cx,cy],i)=>(
+          <mesh key={i} position={[cx,cy,PD/2+0.01]}>
+            <circleGeometry args={[0.038,8]}/>
+            <meshBasicMaterial color={COL.correct} toneMapped={false}/>
+          </mesh>
+        ))}
+        <pointLight color={COL.correct} intensity={0.9} distance={2.2} decay={2}/>
+      </>}
     </group>
   );
 }
 
 // ══════════════════════════════════════
-// ObsComp
+// ObsComp - 반투명 장애물
 // ══════════════════════════════════════
 const obsGeoH=new THREE.BoxGeometry(5.4,0.65,0.45);
 const obsGeoV=new THREE.BoxGeometry(0.65,4.2,0.45);
@@ -461,30 +567,40 @@ const obsConeGeo=new THREE.ConeGeometry(0.38,0.65,3);
 
 function ObsComp({data,zPos}){
   const mRef=useRef();
-  useFrame(s=>{if(mRef.current)mRef.current.emissiveIntensity=0.4+Math.sin(s.clock.elapsedTime*7)*0.6;});
+  useFrame(s=>{if(mRef.current)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;});
   const col=COL.obstacle;
-  // JSX에서 ref를 material에 직접 달기 위해 별도 컴포넌트 사용
-  const ObsMat=()=><meshStandardMaterial ref={mRef} color={col} emissive={col} emissiveIntensity={0.7} roughness={0.25} metalness={0.5} transparent opacity={0.92}/>;
+  const ObsMat=()=><meshStandardMaterial ref={mRef} color={col} emissive={col}
+    emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>;
+  const EdgeMat=()=><meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>;
   if(data.obstacleType==='top')return(
     <group position={[0,3.1,zPos]}>
       <mesh geometry={obsGeoH}><ObsMat/></mesh>
-      {[-2.1,-0.7,0.7,2.1].map((x,i)=><mesh key={i} position={[x,-0.22,0.24]}><planeGeometry args={[0.38,0.28]}/><meshBasicMaterial color="#ffe600" side={THREE.DoubleSide}/></mesh>)}
-      <mesh position={[0,-0.52,0.24]} rotation={[0,0,Math.PI]} geometry={obsConeGeo}><meshBasicMaterial color="#fff"/></mesh>
-      <pointLight color={col} intensity={2.5} distance={5} decay={2}/>
+      {/* 엣지 와이어프레임 강조 */}
+      <lineSegments geometry={new THREE.EdgesGeometry(obsGeoH)}>
+        <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
+      </lineSegments>
+      <mesh position={[0,-0.52,0.24]} rotation={[0,0,Math.PI]} geometry={obsConeGeo}><EdgeMat/></mesh>
+      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
     </group>
   );
   if(data.obstacleType==='left')return(
     <group position={[-2.8,1.7,zPos]}>
       <mesh geometry={obsGeoV}><ObsMat/></mesh>
-      <mesh position={[0.55,0,0.24]} rotation={[0,0,-Math.PI/2]} geometry={obsConeGeo}><meshBasicMaterial color="#fff"/></mesh>
-      <pointLight color={col} intensity={2.5} distance={5} decay={2}/>
+      <lineSegments geometry={new THREE.EdgesGeometry(obsGeoV)}>
+        <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
+      </lineSegments>
+      <mesh position={[0.55,0,0.24]} rotation={[0,0,-Math.PI/2]} geometry={obsConeGeo}><EdgeMat/></mesh>
+      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
     </group>
   );
   return(
     <group position={[2.8,1.7,zPos]}>
       <mesh geometry={obsGeoV}><ObsMat/></mesh>
-      <mesh position={[-0.55,0,0.24]} rotation={[0,0,Math.PI/2]} geometry={obsConeGeo}><meshBasicMaterial color="#fff"/></mesh>
-      <pointLight color={col} intensity={2.5} distance={5} decay={2}/>
+      <lineSegments geometry={new THREE.EdgesGeometry(obsGeoV)}>
+        <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
+      </lineSegments>
+      <mesh position={[-0.55,0,0.24]} rotation={[0,0,Math.PI/2]} geometry={obsConeGeo}><EdgeMat/></mesh>
+      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
     </group>
   );
 }
@@ -638,21 +754,22 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       const cz=PLAYER_Z-(o.time-time)*NOTE_SPEED;
       if(cz>MISS_Z+3){aoRef.current.splice(i,1);continue;}
       if(cz>PLAYER_Z-2.5&&cz<PLAYER_Z+1.5&&head.detected&&obsCool.current<=0){
-        // 얼굴 중심 Y: 화면 아래로 갈수록 1
-        // 얼굴 중심 X: 미러보정 후 0=왼쪽, 1=오른쪽
-        // top 장애물: 고개를 숙이면 얼굴 Y가 커짐 → y가 아직 작으면(≤0.42) 안 숙인 것
-        // left 장애물: 오른쪽으로 피해야 → 얼굴이 아직 중앙 왼쪽(x<0.42)이면 충돌
-        // right 장애물: 왼쪽으로 피해야 → 얼굴이 아직 중앙 오른쪽(x>0.58)이면 충돌
-        const hit=o.obstacleType==='top'  ? head.y<=0.42
-                 :o.obstacleType==='left' ? head.x<=0.42
-                 :                          head.x>=0.58;
+        // top: 고개를 숙여야 → y > 0.48이면 숙인 것 (범위 완화)
+        // left: 오른쪽으로 피해야 → x > 0.52이면 피한 것
+        // right: 왼쪽으로 피해야 → x < 0.48이면 피한 것
+        const isMob=window.innerWidth<window.innerHeight;
+        const topThresh=isMob?0.50:0.48;
+        const sideThresh=isMob?0.45:0.44;
+        const hit=o.obstacleType==='top'  ? head.y<=topThresh
+                 :o.obstacleType==='left' ? head.x<=sideThresh
+                 :                          head.x>=(1-sideThresh);
         if(hit){o.hit=true;obsCool.current=2.5;shk.current=0.85;onObstacleHit();aoRef.current.splice(i,1);}
       }
     }
   });
 
   const visNotes=useMemo(()=>
-    chartRef.current.notes.filter(n=>!n.missed&&(!n.hit||(ct-(n.hitTime??0))<0.55)&&n.time-ct<5.5&&n.time-ct>-2)
+    chartRef.current.notes.filter(n=>!n.missed&&(!n.hit||(ct-(n.hitTime??0))<1.2)&&n.time-ct<5.5&&n.time-ct>-2)
   ,[tick,ct]);
   const visObs=useMemo(()=>
     chartRef.current.obstacles.filter(o=>!o.hit&&o.time-ct<5.5&&o.time-ct>-1)
@@ -805,8 +922,8 @@ function App(){
       <video ref={videoRef} style={{position:'absolute',opacity:0,pointerEvents:'none',width:640,height:480}} playsInline muted autoPlay/>
       {flash&&<div style={{position:'absolute',inset:0,background:'rgba(220,38,38,.48)',zIndex:60,pointerEvents:'none',animation:'dmgflash .32s ease-out forwards'}}/>}
 
-      <Canvas frameloop="always" dpr={[1,Math.min(window.devicePixelRatio??1,1.5)]}
-        gl={{antialias:true,powerPreference:'high-performance'}} shadows={false}>
+      <Canvas frameloop="always" dpr={[1,Math.min(window.devicePixelRatio??1,1.3)]}
+        gl={{antialias:false,powerPreference:'high-performance'}} shadows={false}>
         {gs===GS.PLAYING&&playing&&
           <GameScene gameStatus={gs} audioRef={audioRef}
             handDataRef={handDataRef} headPositionRef={headPositionRef}
