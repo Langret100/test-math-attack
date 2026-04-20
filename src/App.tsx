@@ -6,7 +6,7 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { useProgress } from '@react-three/drei';
-import { GameStatus, NoteData } from './types';
+import { GameStatus, NoteData, HitResult } from './types';
 import { DEMO_CHART, DEMO_OBSTACLES, SONG_URL, MULTIPLIER_OPTIONS } from './constants';
 import { useMediaPipe } from './hooks/useMediaPipe';
 import GameScene from './components/GameScene';
@@ -61,6 +61,47 @@ const App: React.FC = () => {
 
   const audioRef = useRef<HTMLAudioElement>(new Audio(SONG_URL));
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+
+  // Web Audio sound effects
+  const playHitSound = useCallback((freq = 440, type: OscillatorType = 'sine', dur = 0.08) => {
+    try {
+      if (!audioCtxRef.current) audioCtxRef.current = new AudioContext();
+      const ctx = audioCtxRef.current;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = freq;
+      osc.type = type;
+      gain.gain.setValueAtTime(0.3, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+      osc.start(); osc.stop(ctx.currentTime + dur);
+    } catch {}
+  }, []);
+
+  const playHeartSound = useCallback(() => {
+    try {
+      if (!audioCtxRef.current) audioCtxRef.current = new AudioContext();
+      const ctx = audioCtxRef.current;
+      // Rising arpeggio for heart
+      [523, 659, 784].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.frequency.value = freq;
+        osc.type = 'sine';
+        const t = ctx.currentTime + i * 0.07;
+        gain.gain.setValueAtTime(0, t);
+        gain.gain.linearRampToValueAtTime(0.25, t + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+        osc.start(t); osc.stop(t + 0.2);
+      });
+    } catch {}
+  }, []);
+
+  const playMissSound = useCallback(() => {
+    playHitSound(150, 'sawtooth', 0.15);
+  }, [playHitSound]);
 
   const { isCameraReady, handPositionsRef, headPositionRef, lastResultsRef, error: cameraError } = useMediaPipe(videoRef);
   const { progress } = useProgress();
@@ -83,11 +124,13 @@ const App: React.FC = () => {
     setTimeout(() => setShowDamageFlash(false), 300);
   }, []);
 
-  const handleNoteHit = useCallback((note: NoteData, goodCut: boolean) => {
-    if (navigator.vibrate) navigator.vibrate(goodCut ? 40 : 20);
+  const handleNoteHit = useCallback((note: NoteData, result: HitResult) => {
+    const { colorMatch, numberCorrect } = result;
 
+    // ── 하트 노트 ──────────────────────────────────────────────
     if (note.noteType === 'heart') {
-      // Heart note: restore one heart
+      playHeartSound();
+      if (navigator.vibrate) navigator.vibrate(60);
       setHearts(h => Math.min(MAX_HEARTS, h + 1));
       showMessage('💖 +1 라이프!', '#ec4899');
       setScore(s => s + 200);
@@ -95,37 +138,67 @@ const App: React.FC = () => {
       return;
     }
 
+    // ── 숫자 노트 ─────────────────────────────────────────────
+    // 점수 규칙:
+    //  1. 색 다름 + 숫자 맞음  → 기본 점수 (300)
+    //  2. 색 같음 + 숫자 맞음  → 2배 점수 (600)
+    //  3. 색 같음 + 숫자 틀림  → 반절 점수 (150) — 하지만 콤보 리셋
+    //  4. 색 다름 + 숫자 틀림  → 감점 + 데미지
     if (note.noteType === 'number') {
-      // Check if it's a correct multiple
-      const isCorrect = note.numberValue !== undefined && note.numberValue % numberMultiplier === 0;
-      if (isCorrect) {
-        const pts = 300 * (combo > 10 ? 2 : 1);
+      const comboMult = combo > 20 ? 2 : combo > 10 ? 1.5 : 1;
+      if (colorMatch && numberCorrect) {
+        // 케이스 2: 완벽
+        const pts = Math.round(600 * comboMult);
+        playHitSound(880, 'sine', 0.12);
+        if (navigator.vibrate) navigator.vibrate(50);
         setScore(s => s + pts);
         setCombo(c => c + 1);
-        showMessage(`✓ ${note.numberValue} = ${numberMultiplier}의 배수! +${pts}`, '#f59e0b');
-      } else {
-        // Wrong number hit = penalty (same as miss)
+        showMessage(`🎯 색+숫자 완벽! +${pts}`, '#22c55e');
+      } else if (!colorMatch && numberCorrect) {
+        // 케이스 1: 숫자만 맞음
+        const pts = Math.round(300 * comboMult);
+        playHitSound(660, 'sine', 0.1);
+        if (navigator.vibrate) navigator.vibrate(30);
+        setScore(s => s + pts);
+        setCombo(c => c + 1);
+        showMessage(`✓ ${note.numberValue} 맞음 (색 불일치) +${pts}`, '#f59e0b');
+      } else if (colorMatch && !numberCorrect) {
+        // 케이스 3: 색만 맞음 → 반절 점수, 콤보 리셋
+        const pts = 150;
+        playHitSound(330, 'triangle', 0.1);
+        if (navigator.vibrate) navigator.vibrate(20);
+        setScore(s => s + pts);
         setCombo(0);
-        showMessage(`✗ ${note.numberValue}은 ${numberMultiplier}의 배수가 아님!`, '#ef4444');
+        showMessage(`△ ${note.numberValue}은 ${numberMultiplier}의 배수 아님 +${pts}`, '#f97316');
+      } else {
+        // 케이스 4: 색도 다르고 숫자도 틀림 → 감점
+        playMissSound();
+        if (navigator.vibrate) navigator.vibrate([30, 20, 30]);
+        setCombo(0);
+        showMessage(`✗ 색도 숫자도 틀림! -❤️`, '#ef4444');
         handleDamage();
       }
       return;
     }
 
-    // Normal note
-    // goodCut = correct color AND sufficient speed; !goodCut = wrong color or slow
-    if (!goodCut) {
+    // ── 일반 노트 ─────────────────────────────────────────────
+    // 색 같음 → 점수, 색 다름 → 감점
+    if (colorMatch) {
+      playHitSound(note.type === 'left' ? 440 : 550, 'sine', 0.08);
+      if (navigator.vibrate) navigator.vibrate(40);
+      const points = 150;
+      const multiplier = combo > 20 ? 4 : combo > 10 ? 2 : 1;
+      setCombo(c => c + 1);
+      setScore(s => s + points * multiplier);
+      showMessage(`GREAT! +${points * multiplier}`, note.type === 'left' ? '#ef4444' : '#3b82f6');
+    } else {
+      playMissSound();
+      if (navigator.vibrate) navigator.vibrate([30, 20, 30]);
       setCombo(0);
-      showMessage(`✗ 색이 다른 손으로 쳤어요!`, '#ef4444');
+      showMessage(`✗ 색이 다른 손으로 쳤어요! -❤️`, '#ef4444');
       handleDamage();
-      return;
     }
-    const points = 150;
-    const multiplier = combo > 20 ? 4 : combo > 10 ? 2 : 1;
-    setCombo(c => c + 1);
-    setScore(s => s + points * multiplier);
-    showMessage(`GREAT! +${points * multiplier}`, '#3b82f6');
-  }, [numberMultiplier, combo, showMessage, handleDamage]);
+  }, [numberMultiplier, combo, showMessage, handleDamage, playHitSound, playHeartSound, playMissSound]);
 
   const handleNoteMiss = useCallback((note: NoteData) => {
     setCombo(0);

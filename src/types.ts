@@ -69,3 +69,9 @@ export const COLORS = {
   track: '#111111',
   hittable: '#ffffff'
 };
+
+// Passed to onNoteHit — carries full context for scoring
+export interface HitResult {
+  colorMatch: boolean;   // hit by correct color saber
+  numberCorrect: boolean; // for number notes: was it the right multiple?
+}
