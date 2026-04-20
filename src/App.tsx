@@ -52,11 +52,12 @@ const App: React.FC = () => {
   const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(0);
   const [hearts, setHearts] = useState(MAX_HEARTS);
-  const [numberMultiplier, setNumberMultiplier] = useState(5); // active multiplier shown to player
+  const [numberMultiplier, setNumberMultiplier] = useState(5);
   const [nextMultiplier, setNextMultiplier] = useState(5);
   const [obstacleWarning, setObstacleWarning] = useState<'top' | 'left' | 'right' | null>(null);
   const [showDamageFlash, setShowDamageFlash] = useState(false);
   const [lastHitMessage, setLastHitMessage] = useState<{ text: string; color: string } | null>(null);
+  const [gameKey, setGameKey] = useState(0); // bump to remount GameScene cleanly
 
   const audioRef = useRef<HTMLAudioElement>(new Audio(SONG_URL));
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -67,6 +68,19 @@ const App: React.FC = () => {
   const showMessage = useCallback((text: string, color: string) => {
     setLastHitMessage({ text, color });
     setTimeout(() => setLastHitMessage(null), 800);
+  }, []);
+
+  const handleDamage = useCallback(() => {
+    setHearts(h => {
+      const newH = h - 1;
+      if (newH <= 0) {
+        setTimeout(() => endGame(false), 100);
+        return 0;
+      }
+      return newH;
+    });
+    setShowDamageFlash(true);
+    setTimeout(() => setShowDamageFlash(false), 300);
   }, []);
 
   const handleNoteHit = useCallback((note: NoteData, goodCut: boolean) => {
@@ -99,25 +113,19 @@ const App: React.FC = () => {
     }
 
     // Normal note
-    const points = goodCut ? 150 : 100;
+    // goodCut = correct color AND sufficient speed; !goodCut = wrong color or slow
+    if (!goodCut) {
+      setCombo(0);
+      showMessage(`✗ 색이 다른 손으로 쳤어요!`, '#ef4444');
+      handleDamage();
+      return;
+    }
+    const points = 150;
     const multiplier = combo > 20 ? 4 : combo > 10 ? 2 : 1;
     setCombo(c => c + 1);
     setScore(s => s + points * multiplier);
-    if (goodCut) showMessage(`GREAT! +${points * multiplier}`, '#3b82f6');
-  }, [numberMultiplier, combo, showMessage]);
-
-  const handleDamage = useCallback(() => {
-    setHearts(h => {
-      const newH = h - 1;
-      if (newH <= 0) {
-        setTimeout(() => endGame(false), 100);
-        return 0;
-      }
-      return newH;
-    });
-    setShowDamageFlash(true);
-    setTimeout(() => setShowDamageFlash(false), 300);
-  }, []);
+    showMessage(`GREAT! +${points * multiplier}`, '#3b82f6');
+  }, [numberMultiplier, combo, showMessage, handleDamage]);
 
   const handleNoteMiss = useCallback((note: NoteData) => {
     setCombo(0);
@@ -153,6 +161,7 @@ const App: React.FC = () => {
     setHearts(MAX_HEARTS);
     const startMult = MULTIPLIER_OPTIONS[Math.floor(Math.random() * MULTIPLIER_OPTIONS.length)];
     setNumberMultiplier(startMult);
+    setGameKey(k => k + 1); // remount GameScene to reset all refs cleanly
 
     DEMO_CHART.forEach(n => { n.hit = false; n.missed = false; });
     DEMO_OBSTACLES.forEach(o => { o.hit = false; });
@@ -220,6 +229,7 @@ const App: React.FC = () => {
       <Canvas shadows dpr={[1, 2]}>
         {gameStatus !== GameStatus.LOADING && (
           <GameScene
+            key={gameKey}
             gameStatus={gameStatus}
             audioRef={audioRef}
             handPositionsRef={handPositionsRef}
@@ -321,7 +331,6 @@ const App: React.FC = () => {
               <h1 className="text-6xl font-black text-white mb-4 tracking-tighter italic drop-shadow-[0_0_30px_rgba(59,130,246,0.6)]">
                 MATH <span className="text-blue-500">ATTACK</span></h1>
                       <p className="text-amber-400 text-lg font-bold tracking-widest mb-2">메스어택 &mdash; 수학 공격</p>
-              </h1>
 
               <div className="space-y-3 text-gray-300 mb-6 text-sm">
                 <div className="bg-white/5 rounded-xl p-3 border border-white/10 text-left space-y-2">

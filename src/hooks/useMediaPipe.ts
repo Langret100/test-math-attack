@@ -9,13 +9,14 @@ import * as THREE from 'three';
 import { HeadPosition } from '../types';
 
 const mapHandToWorld = (x: number, y: number): THREE.Vector3 => {
-  const GAME_X_RANGE = 5;
-  const GAME_Y_RANGE = 3.5;
-  const Y_OFFSET = 0.8;
+  const GAME_X_RANGE = 4.5;
+  const GAME_Y_RANGE = 3.0;
+  // Raise Y offset so hands cover the note layer range (0.8~2.4)
+  const Y_OFFSET = 1.6;
 
   const worldX = (0.5 - x) * GAME_X_RANGE;
   const worldY = (1.0 - y) * GAME_Y_RANGE - (GAME_Y_RANGE / 2) + Y_OFFSET;
-  const worldZ = -Math.max(0, worldY * 0.2);
+  const worldZ = 0; // keep Z fixed; Z collision is ignored in hit detection
 
   return new THREE.Vector3(worldX, Math.max(0.1, worldY), worldZ);
 };

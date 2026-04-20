@@ -65,7 +65,6 @@ const GameScene: React.FC<GameSceneProps> = ({
   useEffect(() => {
     const processedNotes = chart.map(note => {
       if (note.noteType === 'number') {
-        // Assign actual number values: 60% correct, 40% wrong
         const isCorrect = Math.random() < 0.6;
         return {
           ...note,
@@ -76,6 +75,11 @@ const GameScene: React.FC<GameSceneProps> = ({
     });
     setNotesState(processedNotes);
     setObstaclesState([...obstacles]);
+    // Reset all active state so notes fly in fresh from the start
+    activeNotesRef.current = [];
+    activeObstaclesRef.current = [];
+    nextNoteIndexRef.current = 0;
+    nextObsIndexRef.current = 0;
   }, [chart, obstacles]);
 
   const handleHit = (note: NoteData, goodCut: boolean) => {
@@ -171,27 +175,56 @@ const GameScene: React.FC<GameSceneProps> = ({
         continue;
       }
 
-      // Collision window
-      if (currentZ > PLAYER_Z - 1.5 && currentZ < PLAYER_Z + 1.0) {
-        const handPos = note.type === 'left' ? hands.left : hands.right;
-        const handVel = note.type === 'left' ? hands.leftVelocity : hands.rightVelocity;
+      // Collision window: only when note is right in front of player
+      if (currentZ > PLAYER_Z - 0.8 && currentZ < PLAYER_Z + 0.5) {
+        const noteX = LANE_X_POSITIONS[note.lineIndex];
+        const noteY = LAYER_Y_POSITIONS[note.lineLayer];
 
-        if (handPos) {
-          const notePos = vecA.set(
-            LANE_X_POSITIONS[note.lineIndex],
-            LAYER_Y_POSITIONS[note.lineLayer],
-            currentZ
-          );
+        const leftPos = hands.left;
+        const rightPos = hands.right;
+        const leftVel = hands.leftVelocity;
+        const rightVel = hands.rightVelocity;
 
-          if (handPos.distanceTo(notePos) < 0.9) {
-            const speed = handVel.length();
-            let goodCut = speed >= 1.2;
+        // XY distance only (ignore Z — blade is long and z alignment is unreliable)
+        const HIT_RADIUS_XY = 0.75;
+        // Minimum swing speed to register a hit (prevents idle touching)
+        const MIN_SWING_SPEED = 1.5;
 
-            note.hit = true;
-            note.hitTime = time;
-            handleHit(note, goodCut);
-            activeNotesRef.current.splice(i, 1);
+        let hitHand: 'left' | 'right' | null = null;
+        let hitSpeed = 0;
+
+        const leftSpd = leftVel ? leftVel.length() : 0;
+        const rightSpd = rightVel ? rightVel.length() : 0;
+
+        if (leftPos) {
+          const dx = leftPos.x - noteX;
+          const dy = leftPos.y - noteY;
+          const dist2D = Math.sqrt(dx * dx + dy * dy);
+          if (dist2D < HIT_RADIUS_XY && leftSpd >= MIN_SWING_SPEED) {
+            hitHand = 'left';
+            hitSpeed = leftSpd;
           }
+        }
+        if (!hitHand && rightPos) {
+          const dx = rightPos.x - noteX;
+          const dy = rightPos.y - noteY;
+          const dist2D = Math.sqrt(dx * dx + dy * dy);
+          if (dist2D < HIT_RADIUS_XY && rightSpd >= MIN_SWING_SPEED) {
+            hitHand = 'right';
+            hitSpeed = rightSpd;
+          }
+        }
+
+        if (hitHand !== null) {
+          // Color match: normal notes need correct hand; number/heart accept either hand
+          const needsColorMatch = note.noteType === 'normal';
+          const colorMatch = !needsColorMatch || hitHand === note.type;
+          const goodCut = colorMatch && hitSpeed >= MIN_SWING_SPEED;
+
+          note.hit = true;
+          note.hitTime = time;
+          handleHit(note, goodCut);
+          activeNotesRef.current.splice(i, 1);
         }
       }
     }
