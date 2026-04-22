@@ -55,6 +55,227 @@ const PW=0.82,PH=0.82,PD=0.13; // 판 크기
 const SONG_URL='https://commondatastorage.googleapis.com/codeskulptor-demos/riceracer_assets/music/race2.ogg';
 
 // ══════════════════════════════════════
+// 벽 부수기 이벤트
+// ══════════════════════════════════════
+const WALL_HITS_NEEDED=20;
+const WALL_SPAWN_Z=-1.5; // 바로 플레이어 앞에 팝업
+const WALL_TIME_LIMIT=5; // 5초 안에 못 부수면 하트 감소
+
+// geometry 캐싱 (매 프레임 생성 방지 → 렉 제거)
+const _wallBodyGeo=new THREE.BoxGeometry(5.2,3.2,0.28);
+const _wallBrickGeo=new THREE.BoxGeometry(1.25,0.6,0.01);
+const _wallEdgesGeo=new THREE.EdgesGeometry(_wallBodyGeo);
+const _wallBrickEdges=new THREE.EdgesGeometry(_wallBrickGeo);
+const _wallHPBgGeo=new THREE.PlaneGeometry(5.0,0.14);
+const _debrisCubeGeo=new THREE.BoxGeometry(1,1,1); // scale로 크기 조절
+
+// 벽 파편 파티클 (캐싱된 geometry 사용)
+function WallParticle({dx,dy,color,speed,size,life}){
+  const r=useRef();
+  useFrame((_,dt)=>{
+    if(!r.current)return;
+    const t=(r.current.userData.t=(r.current.userData.t??0)+dt);
+    if(t>life){r.current.visible=false;return;}
+    r.current.visible=true;
+    const f=t/life;
+    r.current.position.set(dx*speed*t, dy*speed*t-5*t*t, (Math.random()-0.5)*0.3*t);
+    r.current.scale.setScalar(Math.max(0.01,size*(1-f*f)));
+    if(r.current.material)r.current.material.opacity=Math.max(0,1-f*1.5);
+  });
+  return(
+    <mesh ref={r} geometry={_debrisCubeGeo}>
+      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/>
+    </mesh>
+  );
+}
+
+function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWallTimeout}){
+  const grp=useRef();
+  const shakeRef=useRef(0);
+  const hitCoolRef=useRef(0);
+  const[broken,setBroken]=useState(false);
+  const[prog,setProg]=useState(0); // 0~1
+  const progRef=useRef(0);
+  const hpRef=useRef(); // HP바 mesh ref
+  const timerRef=useRef(0); // 경과 시간
+  const sparks=useRef([]); // 불꽃 파티클 [{x,y,dx,dy,t,life}]
+  const sparkMeshes=useRef([]); // 파티클 mesh refs (고정 풀)
+  const SPARK_POOL=24; // 풀 크기
+
+  // 균열/벽돌 위치 고정 (useMemo로 한번만 계산)
+  const crackSeeds=useMemo(()=>Array.from({length:14},(_,i)=>({
+    x:(Math.random()-0.5)*4.2, y:(Math.random()-0.5)*2.8,
+    len:0.3+Math.random()*0.9, angle:Math.random()*Math.PI,
+  })),[]);
+  const brickPositions=useMemo(()=>{
+    const arr=[];
+    for(let row=0;row<5;row++)for(let col=0;col<4;col++)
+      arr.push([col*1.3-1.95, row*0.64-1.28]);
+    return arr;
+  },[]);
+  const debrisData=useMemo(()=>Array.from({length:30},(_,i)=>({
+    dx:(Math.random()-0.5)*3, dy:0.5+Math.random()*2,
+    speed:3+Math.random()*6, size:0.12+Math.random()*0.22,
+    life:0.6+Math.random()*0.5,
+    color:i%3===0?'#555':i%3===1?'#3a3a3a':'#888',
+  })),[]);
+
+  // 직전 state 추적 (idle→stopped 전환 감지)
+  const prevStateRef=useRef('idle');
+
+  useFrame((_,dt)=>{
+    if(!grp.current||!wallRef.current)return;
+    const w=wallRef.current;
+
+    // idle→stopped 전환 감지 → 상태 리셋
+    if(prevStateRef.current==='idle'&&w.state==='stopped'){
+      timerRef.current=0;
+      progRef.current=0;
+      shakeRef.current=0;
+      hitCoolRef.current=0;
+      sparks.current=[];
+      setBroken(false);
+      if(grp.current)grp.current.visible=true;
+    }
+    prevStateRef.current=w.state;
+
+    if(w.state==='idle')return;
+
+    // 5초 타이머
+    if(w.state==='stopped'){
+      timerRef.current+=dt;
+      if(timerRef.current>=WALL_TIME_LIMIT){
+        w.state='idle';
+        onWallTimeout?.();
+        return;
+      }
+    }
+
+    // 흔들림
+    shakeRef.current=Math.max(0,shakeRef.current-dt*5);
+    const sh=shakeRef.current;
+    const sx=(Math.random()-0.5)*sh*0.1;
+    const sy=(Math.random()-0.5)*sh*0.1;
+    grp.current.position.set(sx,1.5+sy,WALL_SPAWN_Z);
+    grp.current.visible=true;
+
+    // HP바 직접 업데이트 (state 없이 ref로)
+    if(hpRef.current){
+      const p=progRef.current;
+      const w2=5.0*(1-p);
+      hpRef.current.scale.x=Math.max(0.001,1-p);
+      hpRef.current.material.color.set(p<0.4?'#ef4444':p<0.7?'#f97316':'#22c55e');
+    }
+
+    // 불꽃 파티클 업데이트
+    const now3=performance.now()/1000;
+    sparks.current=sparks.current.filter(s=>(now3-s.t)<s.life);
+    sparkMeshes.current.forEach((m,i)=>{
+      if(!m)return;
+      const s=sparks.current[i];
+      if(!s){m.visible=false;return;}
+      const dt2=now3-s.t, f=dt2/s.life;
+      m.visible=true;
+      m.position.set(s.x+s.dx*dt2, 1.5+s.y+s.dy*dt2-4*dt2*dt2, 0.2);
+      m.scale.setScalar(Math.max(0.01,0.08*(1-f*f)));
+      if(m.material)m.material.opacity=Math.max(0,1-f*f*2);
+    });
+
+    // 히트 판정
+    if(w.state==='stopped' && hitCoolRef.current<=0){
+      const hd=handDataRef.current;
+      for(const hand of[hd.left,hd.right]){
+        if(!hand)continue;
+        const {pos,vel}=hand;
+        const spd=vel?.length()??0;
+        if(Math.abs(pos.x)<2.8&&pos.y>-0.2&&pos.y<3.2&&spd>1.2){
+          hitCoolRef.current=0.15;
+          progRef.current=Math.min(1, progRef.current+1/WALL_HITS_NEEDED);
+          shakeRef.current=Math.min(3.5, shakeRef.current+1.4);
+          playWallHit();
+          // 불꽃 파티클 추가
+          const now2=performance.now()/1000;
+          for(let s=0;s<8;s++){
+            const a=Math.random()*Math.PI*2;
+            const spd=3+Math.random()*5;
+            sparks.current.push({x:pos.x*(0.15),y:pos.y*(0.12),
+              dx:Math.cos(a)*spd,dy:Math.sin(a)*spd,t:now2,life:0.22+Math.random()*0.18});
+          }
+          onWallHit(Math.round(progRef.current*WALL_HITS_NEEDED));
+          if(progRef.current>=1){
+            w.state='breaking';
+            setBroken(true);
+            onWallBreak();
+            return;
+          }
+          break;
+        }
+      }
+    }
+    if(hitCoolRef.current>0)hitCoolRef.current-=dt;
+  });
+
+  // broken state 대신 wallRef.current.state로 직접 판단
+  if(!wallRef.current)return null;
+  const wstate=wallRef.current.state;
+  if(wstate==='idle')return null;
+  if(wstate==='breaking'||broken){
+    return(
+      <group position={[0,1.5,WALL_SPAWN_Z]}>
+        {debrisData.map((d,i)=><WallParticle key={i} {...d}/>)}
+      </group>
+    );
+  }
+
+  return(
+    <group ref={grp} position={[0,1.5,WALL_SPAWN_Z]}>
+      {/* 벽 본체 */}
+      <mesh geometry={_wallBodyGeo}>
+        <meshStandardMaterial color='#0d0d0d' roughness={0.9} metalness={0.05}
+          emissive='#1a0a0a' emissiveIntensity={0.4}/>
+      </mesh>
+      {/* 벽돌 패턴 (edges 캐싱) */}
+      {brickPositions.map(([bx,by],i)=>(
+        <lineSegments key={i} position={[bx,by,0.15]} geometry={_wallBrickEdges}>
+          <lineBasicMaterial color='#2a2a2a' toneMapped={false}/>
+        </lineSegments>
+      ))}
+      {/* 테두리 */}
+      <lineSegments geometry={_wallEdgesGeo}>
+        <lineBasicMaterial color='#555' toneMapped={false}/>
+      </lineSegments>
+      {/* 균열선 — crackOpacity는 progRef 기반으로 useFrame에서 업데이트 어려우니 useMemo로 고정 노출 */}
+      {crackSeeds.map((c,i)=>(
+        <mesh key={i} position={[c.x,c.y,0.16]} rotation={[0,0,c.angle]}>
+          <planeGeometry args={[c.len,0.022]}/>
+          <meshBasicMaterial color='#ff5500' toneMapped={false} transparent opacity={0.0}
+            ref={el=>{if(el)el._crackIdx=i;}}/>
+        </mesh>
+      ))}
+      {/* HP바 */}
+      <mesh ref={hpRef} position={[0,1.9,0.16]}>
+        <planeGeometry args={[5.0,0.16]}/>
+        <meshBasicMaterial color='#22c55e' toneMapped={false}/>
+      </mesh>
+      <mesh position={[0,1.9,0.15]} geometry={_wallHPBgGeo}>
+        <meshBasicMaterial color='#111' toneMapped={false} transparent opacity={0.7}/>
+      </mesh>
+      <pointLight color='#ff3300' intensity={4+shakeRef.current*3} distance={7} decay={2}/>
+      {/* 불꽃 파티클 풀 */}
+      {Array.from({length:SPARK_POOL},(_,i)=>(
+        <mesh key={`sp${i}`} ref={el=>sparkMeshes.current[i]=el} visible={false}>
+          <sphereGeometry args={[1,4,4]}/>
+          <meshBasicMaterial color={i%3===0?'#ffffff':i%3===1?'#ffcc44':'#ff6600'}
+            toneMapped={false} transparent opacity={1}/>
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+
+
+// ══════════════════════════════════════
 // 효과음
 // ══════════════════════════════════════
 let _actx=null;
@@ -64,6 +285,14 @@ const playHit=(good)=>{try{const c=actx();const b=c.createBuffer(1,c.sampleRate*
 const playMiss=()=>{try{const c=actx(),o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.type='square';o.frequency.setValueAtTime(200,c.currentTime);o.frequency.exponentialRampToValueAtTime(70,c.currentTime+0.22);g.gain.setValueAtTime(0.28,c.currentTime);g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+0.25);o.start();o.stop(c.currentTime+0.26);}catch(e){}};
 const playDamage=()=>{try{const c=actx();for(let k=0;k<3;k++){const o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.type='square';const t=c.currentTime+k*0.07;o.frequency.setValueAtTime(140-k*28,t);g.gain.setValueAtTime(0.22,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.06);o.start(t);o.stop(t+0.07);}}catch(e){}};
 const playHeart=()=>{try{const c=actx();[523,659,784,1047].forEach((f,i)=>{const o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.type='sine';o.frequency.value=f;const t=c.currentTime+i*0.07;g.gain.setValueAtTime(0.18,t);g.gain.exponentialRampToValueAtTime(0.001,t+0.11);o.start(t);o.stop(t+0.12);});}catch(e){}};
+// 광선검 베기 효과음 (슈우웅)
+const playSaberSlice=()=>{try{const c=actx();const o=c.createOscillator(),g=c.createGain(),f=c.createBiquadFilter();o.connect(f);f.connect(g);g.connect(c.destination);o.type='sawtooth';f.type='bandpass';f.frequency.setValueAtTime(1800,c.currentTime);f.frequency.exponentialRampToValueAtTime(400,c.currentTime+0.09);f.Q.value=1.8;o.frequency.setValueAtTime(320,c.currentTime);o.frequency.exponentialRampToValueAtTime(90,c.currentTime+0.09);g.gain.setValueAtTime(0.22,c.currentTime);g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+0.1);o.start();o.stop(c.currentTime+0.11);}catch(e){}};
+// 벽 타격음 (쿵)
+const playWallHit=()=>{try{const c=actx();const b=c.createBuffer(1,c.sampleRate*0.08,c.sampleRate),d=b.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*Math.exp(-i/d.length*12);const s=c.createBufferSource(),g=c.createGain(),f=c.createBiquadFilter();s.buffer=b;f.type='lowpass';f.frequency.value=280;s.connect(f);f.connect(g);g.connect(c.destination);g.gain.value=0.55;s.start();const o=c.createOscillator(),g2=c.createGain();o.type='sine';o.frequency.setValueAtTime(95,c.currentTime);o.frequency.exponentialRampToValueAtTime(40,c.currentTime+0.07);o.connect(g2);g2.connect(c.destination);g2.gain.setValueAtTime(0.35,c.currentTime);g2.gain.exponentialRampToValueAtTime(0.001,c.currentTime+0.08);o.start();o.stop(c.currentTime+0.09);}catch(e){}};
+// 벽 파괴음 (쾅!)
+const playWallBreak=()=>{try{const c=actx();const b=c.createBuffer(1,c.sampleRate*0.35,c.sampleRate),d=b.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*Math.pow(Math.max(0,1-i/(d.length*0.6)),1.5);const s=c.createBufferSource(),g=c.createGain(),f=c.createBiquadFilter();s.buffer=b;f.type='lowpass';f.frequency.value=380;s.connect(f);f.connect(g);g.connect(c.destination);g.gain.value=0.85;s.start();for(let k=0;k<4;k++){const o=c.createOscillator(),gk=c.createGain();o.type='square';const t=c.currentTime+k*0.04;o.frequency.setValueAtTime(160-k*28,t);o.frequency.exponentialRampToValueAtTime(30,t+0.18);o.connect(gk);gk.connect(c.destination);gk.gain.setValueAtTime(0.28-k*0.04,t);gk.gain.exponentialRampToValueAtTime(0.001,t+0.2);o.start(t);o.stop(t+0.21);}}catch(e){}};
+// WARNING 사이렌
+const playWarningSiren=()=>{try{const c=actx();const o=c.createOscillator(),g=c.createGain();o.type='square';o.frequency.setValueAtTime(320,c.currentTime);o.frequency.setValueAtTime(480,c.currentTime+0.15);o.frequency.setValueAtTime(320,c.currentTime+0.3);o.frequency.setValueAtTime(480,c.currentTime+0.45);o.connect(g);g.connect(c.destination);g.gain.setValueAtTime(0.12,c.currentTime);g.gain.setValueAtTime(0.12,c.currentTime+0.58);g.gain.exponentialRampToValueAtTime(0.001,c.currentTime+0.62);o.start();o.stop(c.currentTime+0.63);}catch(e){}};
 
 // ══════════════════════════════════════
 // 채보 — 무한 스트림 방식
@@ -97,13 +326,31 @@ const mkNote=(type,li,ll,t,mult)=>({
   numVal:Math.random()<0.65?mulOf(mult):nonMulOf(mult),
   hit:false,missed:false,hitTime:undefined
 });
-const mkHeart=(li,ll,t)=>({
-  id:`h${_noteId++}`,time:t,lineIndex:li,lineLayer:ll,
+const mkHeart=(t)=>({
+  id:`h${_noteId++}`,time:t,
+  // 하트는 모든 레인/레이어에 고르게 — 양손 어디서든 칠 수 있게
+  lineIndex:rnd([0,1,2,3]),lineLayer:rnd([0,1,2]),
   type:rnd(['left','right']),noteType:'heart',numVal:0,
   hit:false,missed:false,hitTime:undefined
 });
 
-// 새 노트 배치 생성 (time ~ time+window 범위) — 리듬감 있는 패턴
+// ── 베기 라인 패턴 생성기 ──
+// type: 'row'(가로줄), 'col'(세로줄), 'diag'(대각선)
+// 같은 시간 간격으로 3~5개가 일렬로 날아와 광선검으로 쭉 베면 됨
+function makeSlashLine(t, side, lineType, intraGap, mult){
+  // lineType: 'row_bot','row_mid','row_top','col_L','col_R','diag_LR','diag_RL'
+  let positions=[];
+  if(lineType==='row_bot')      positions=[[0,0],[1,0],[2,0],[3,0]]; // 가로 하단
+  else if(lineType==='row_mid') positions=[[0,1],[1,1],[2,1],[3,1]]; // 가로 중단
+  else if(lineType==='row_top') positions=[[0,2],[1,2],[2,2],[3,2]]; // 가로 상단
+  else if(lineType==='col_L')   positions=[[0,0],[0,1],[0,2],[1,0],[1,1]]; // 세로 왼쪽
+  else if(lineType==='col_R')   positions=[[3,0],[3,1],[3,2],[2,0],[2,1]]; // 세로 오른쪽
+  else if(lineType==='diag_LR') positions=[[0,0],[1,1],[2,2],[3,2]]; // 대각 좌하→우상
+  else if(lineType==='diag_RL') positions=[[3,0],[2,1],[1,2],[0,2]]; // 대각 우하→좌상
+  return positions.map(([li,ll],i)=>mkNote(side,li,ll,t+i*intraGap,mult));
+}
+
+// 새 노트 배치 생성 (time ~ time+window 범위)
 function generateNotesInRange(fromT,toT,mult){
   const notes=[],obs=[];
   const diff=getDiffLevel(fromT);
@@ -111,60 +358,82 @@ function generateNotesInRange(fromT,toT,mult){
   const obsGap=DIFF_OBS_GAP[diff];
   const heartGap=DIFF_HEART_GAP[diff];
 
-  // 리듬 패턴 세트 — 춤추듯 반복 가능한 시퀀스
-  // 각 패턴: [lineIndex, lineLayer, type] 의 배열
-  const PATTERNS=[
-    // 좌우 교차 (기본 리듬)
-    [[rnd(lLn),1,'left'],[rnd(rLn),1,'right']],
-    // 왼→왼→오 (연타 느낌)
-    [[0,0,'left'],[1,1,'left'],[rnd(rLn),1,'right']],
-    // 오→오→왼
-    [[3,0,'right'],[2,1,'right'],[rnd(lLn),1,'left']],
-    // 아래→위 계단 (왼)
-    [[rnd(lLn),0,'left'],[rnd(lLn),1,'left'],[rnd(lLn),2,'left']],
-    // 아래→위 계단 (오)
-    [[rnd(rLn),0,'right'],[rnd(rLn),1,'right'],[rnd(rLn),2,'right']],
-    // 지그재그 (좌우 번갈아)
-    [[rnd(lLn),0,'left'],[rnd(rLn),2,'right'],[rnd(lLn),2,'left'],[rnd(rLn),0,'right']],
-    // 양손 동시 x2
-    [[rnd(lLn),rnd(aL),'left'],[rnd(rLn),rnd(aL),'right']],
-    [[rnd(lLn),rnd(aL),'left'],[rnd(rLn),rnd(aL),'right']],
-    // 높은층 좌→낮은층 우
-    [[rnd(lLn),2,'left'],[rnd(rLn),0,'right']],
-    // 낮은층 우→높은층 좌
-    [[rnd(rLn),0,'right'],[rnd(lLn),2,'left']],
-  ];
-
-  let t=Math.ceil(fromT/beatGap)*beatGap;
-  let patIdx=Math.floor(fromT/5)%PATTERNS.length;
-
-  while(t<toT){
-    const pat=PATTERNS[patIdx%PATTERNS.length];
-    // 난이도에 따라 패턴 내 노트 간격 조정
-    const intraGap=diff>=3?beatGap*0.5:diff>=2?beatGap*0.6:beatGap*0.75;
-
-    pat.forEach((p,pi)=>{
-      const nt=t+pi*intraGap;
-      if(nt<toT) notes.push(mkNote(p[2],p[0],p[1],nt,mult));
-    });
-
-    // 다음 패턴 시작 시간: 패턴 길이만큼 진행
-    t+=Math.max(beatGap,pat.length*intraGap+beatGap*0.5);
-    patIdx++;
-  }
-
-  // 장애물
+  // ── 장애물 먼저 생성 ──
   const ot=['top','left','right'];
   let ot_=Math.ceil(fromT/obsGap)*obsGap;
   while(ot_<toT){
     obs.push({id:`o${_obsId++}`,time:ot_,obstacleType:ot[Math.floor(ot_/obsGap)%3],hit:false});
     ot_+=obsGap;
   }
+  // 장애물 시간 집합 (앞뒤 1.0초 버퍼)
+  const OBS_BUF=1.0;
+  const obsTimes=obs.map(o=>o.time);
+  const nearObs=(t)=>obsTimes.some(ot=>Math.abs(t-ot)<OBS_BUF);
+
+  // ── 일반 패턴 ──
+  const NORMAL_PATTERNS=[
+    [[rnd(lLn),0,'left'],[rnd(rLn),2,'right']],
+    [[rnd(lLn),2,'left'],[rnd(rLn),0,'right']],
+    [[rnd(lLn),1,'left'],[rnd(rLn),1,'right']],
+    [[0,0,'left'],[1,1,'left'],[0,2,'left']],
+    [[3,2,'right'],[2,1,'right'],[3,0,'right']],
+    [[rnd(lLn),0,'left'],[rnd(rLn),2,'right'],[rnd(lLn),2,'left'],[rnd(rLn),0,'right']],
+    [[2,0,'right'],[3,1,'right'],[2,2,'right']],
+    [[1,2,'left'],[0,1,'left'],[1,0,'left']],
+    [[rnd(lLn),0,'left'],[rnd(rLn),0,'right']],
+    [[rnd(lLn),2,'left'],[rnd(rLn),2,'right']],
+    [[1,2,'left'],[2,0,'right']],
+    [[0,1,'left'],[3,1,'right']],
+    [[rnd(lLn),rnd(aL),'left'],[rnd(rLn),rnd(aL),'right'],[rnd(lLn),rnd(aL),'left']],
+    [[rnd(rLn),rnd(aL),'right'],[rnd(lLn),rnd(aL),'left'],[rnd(rLn),rnd(aL),'right']],
+    [[0,0,'left'],[3,0,'right'],[0,2,'left'],[3,2,'right']],
+    [[1,1,'left'],[2,1,'right']],
+  ];
+
+  // ── 슬래시 라인: 빠른 고정 간격으로 한 줄 연속 등장 ──
+  // 칼로 슥 베면 다 터지도록 노트간 간격을 짧게 고정
+  const SLASH_TYPES=['row_bot','row_mid','row_top','col_L','col_R','diag_LR','diag_RL'];
+  const SLASH_GAP=0.14; // 노트 간격 0.14초 (빠르게 쭉 연속)
+  const SLASH_INTERVAL=diff>=2?12:diff>=1?18:22; // 등장 최소 간격(초)
+  const SLASH_PROB=diff>=2?0.35:diff>=1?0.28:0.22; // 등장 확률
+
+  let t=Math.ceil(fromT/beatGap)*beatGap;
+  let patIdx=Math.floor(fromT/5)%NORMAL_PATTERNS.length;
+  let lastSlashT=-999;
+
+  while(t<toT){
+    if(nearObs(t)){t+=beatGap;continue;}
+
+    const intraGap=diff>=3?beatGap*0.5:diff>=2?beatGap*0.6:beatGap*0.75;
+
+    // 슬래시 라인 삽입 여부
+    const doSlash=(t-lastSlashT)>SLASH_INTERVAL&&Math.random()<SLASH_PROB;
+    if(doSlash){
+      lastSlashT=t;
+      const slashType=SLASH_TYPES[Math.floor(Math.random()*SLASH_TYPES.length)];
+      const slashSide=Math.random()<0.5?'left':'right';
+      const newNotes=makeSlashLine(t,slashSide,slashType,SLASH_GAP,mult);
+      // nearObs 통과하는 것만 추가
+      newNotes.forEach(n=>{if(n.time<toT&&!nearObs(n.time))notes.push(n);});
+      // 슬래시 라인 끝난 뒤 beatGap*1.2 간격 두고 다음 패턴
+      t+=newNotes.length*SLASH_GAP+beatGap*1.2;
+      patIdx++;
+      continue;
+    }
+
+    const pat=NORMAL_PATTERNS[patIdx%NORMAL_PATTERNS.length];
+    pat.forEach((p,pi)=>{
+      const nt=t+pi*intraGap;
+      if(nt<toT&&!nearObs(nt)) notes.push(mkNote(p[2],p[0],p[1],nt,mult));
+    });
+    t+=Math.max(beatGap,pat.length*intraGap+beatGap*0.5);
+    patIdx++;
+  }
 
   // 하트
   let ht_=Math.ceil(fromT/heartGap)*heartGap;
   while(ht_<toT){
-    notes.push(mkHeart(rnd([1,2]),1,ht_));
+    if(!nearObs(ht_))notes.push(mkHeart(ht_));
     ht_+=heartGap;
   }
 
@@ -176,11 +445,14 @@ function reassignNums(notes,mult){
   notes.forEach(n=>{if(n.noteType==='note'&&!n.hit&&!n.missed)n.numVal=Math.random()<0.65?mulOf(mult):nonMulOf(mult);});
 }
 
-// 초기 채보 (첫 10초치 미리 생성)
+// 초기 채보 (첫 10초치 미리 생성, 4초 딜레이 후 시작)
 function freshChart(mult){
   _noteId=0;_obsId=0;
-  const r=generateNotesInRange(0,10,mult);
-  return{notes:r.notes,obstacles:r.obstacles,genUntil:10};
+  const START_DELAY=4; // 시작 4초 후부터 노트 등장
+  const r=generateNotesInRange(START_DELAY,START_DELAY+10,mult);
+  // 장애물도 딜레이 적용
+  const obsDelayed=r.obstacles.filter(o=>o.time>=START_DELAY+3);
+  return{notes:r.notes,obstacles:obsDelayed,genUntil:START_DELAY+10};
 }
 
 // ══════════════════════════════════════
@@ -231,7 +503,22 @@ function useMediaPipe(videoRef){
         const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}}});
         if(videoRef.current&&active){
           videoRef.current.srcObject=stream;
-          videoRef.current.onloadeddata=()=>{if(active){setReady(true);loop();}};
+          videoRef.current.onloadeddata=()=>{
+            if(!active)return;
+            // 워밍업: 첫 프레임으로 모델 미리 실행해서 초기 끊김 방지
+            setTimeout(()=>{
+              if(!active)return;
+              try{
+                const v2=videoRef.current;
+                if(v2&&v2.videoWidth>0){
+                  const ts=Math.floor(performance.now());
+                  hlRef.current?.detectForVideo(v2,ts);
+                }
+              }catch(e){}
+              setReady(true);
+              loop();
+            },200);
+          };
         }
       }catch(e){console.error(e);setErr(e.message);}
     }
@@ -244,76 +531,71 @@ function useMediaPipe(videoRef){
         try{const hr=hlRef.current.detectForVideo(v,hlTs);lrRef.current=hr;processHands(hr);}
         catch(e){hlTs+=2;}
 
-        // 얼굴: 3프레임마다 (타임스탬프 hlTs와 완전 분리)
+        // 얼굴: 4프레임마다 (실제 ms 타임스탬프 사용)
         fdFrame++;
-        if(fdFrame%3===0&&fdRef.current){
-          fdTs+=1; // 독립 카운터 (hlTs와 무관)
+        if(fdFrame%4===0&&fdRef.current){
           try{
-            const fr=fdRef.current.detectForVideo(v,fdTs);
-            if(fr.detections?.length>0){
-              const bb=fr.detections[0].boundingBox;
-              // MediaPipe FaceDetector bbox는 픽셀 단위
-              const W=v.videoWidth,H=v.videoHeight;
-              const cx=(bb.originX+bb.width*0.5)/W;
-              const cy=(bb.originY+bb.height*0.5)/H;
-              const bh=bb.height/H;
-              // 미러보정: x 반전
-              headRef.current={x:1-cx,y:cy,h:bh,detected:true};
-            }else headRef.current={x:0.5,y:0.4,h:0.3,detected:false};
-          }catch(e){fdTs+=1;}
+            const fdNow=Math.floor(performance.now());
+            if(fdNow>fdTs){
+              fdTs=fdNow;
+              const fr=fdRef.current.detectForVideo(v,fdTs);
+              if(fr.detections?.length>0){
+                const bb=fr.detections[0].boundingBox;
+                const W=v.videoWidth,H=v.videoHeight;
+                const cx=(bb.originX+bb.width*0.5)/W;
+                const cy=(bb.originY+bb.height*0.5)/H;
+                const bh=bb.height/H;
+                // 미러보정: x 반전, y는 그대로 (0=상단, 1=하단)
+                headRef.current={x:1-cx,y:cy,h:bh,detected:true};
+              }else headRef.current={...headRef.current,detected:false};
+            }
+          }catch(e){}
         }
       }
       rafRef.current=requestAnimationFrame(loop);
     }
 
     function processHands(hr){
+      // ── MediaPipe 콜백: raw 목표값만 저장, 보간은 useFrame에서 ──
       const now=performance.now();
       const s=handDataRef.current;
-      const dt=Math.max(0.001,(now-s.lastTs)/1000);
       s.lastTs=now;
-      let nL=null,nR=null;
       const isMobile=window.innerWidth<window.innerHeight;
-      // 인식 범위 대폭 확장: 화면 전체를 넘어서는 넓은 스윙 커버
       const xScale=isMobile?13.0:14.0;
-      const yScale=isMobile?9.0:8.5;
-      const yOff=isMobile?-2.2:-2.5;
+      const yScale=isMobile?8.5:8.0;
+      const yOff=isMobile?-1.2:-1.4;
+
+      let gotL=false,gotR=false;
       if(hr.landmarks?.length>0){
         for(let i=0;i<hr.landmarks.length;i++){
           const lm=hr.landmarks[i];
           const isRight=hr.handedness[i][0].categoryName==='Left';
-          // 손 중심: 손목+검지뿌리+새끼뿌리 평균 (y 클램프 제거 — 위아래 자유롭게)
           const cx=(lm[0].x+lm[5].x+lm[17].x)/3;
           const cy=(lm[0].y+lm[5].y+lm[17].y)/3;
-          const wx=(0.5-cx)*xScale;
-          const wy=(1-cy)*yScale+yOff;
-          const pos=new THREE.Vector3(wx,wy,0); // 클램프 제거
-          // 광선검 방향: 손목→중지끝 (z깊이 강화로 비틀기 자연스럽게)
-          const wx0=(0.5-lm[0].x)*xScale,wy0=(1-lm[0].y)*yScale+yOff;
-          const wx12=(0.5-lm[12].x)*xScale,wy12=(1-lm[12].y)*yScale+yOff;
-          const dir=new THREE.Vector3(wx12-wx0,wy12-wy0,-0.5).normalize();
-          if(isRight)nR={pos,dir};else nL={pos,dir};
+          const tx=(0.5-cx)*xScale;
+          const ty=(1-cy)*yScale+yOff;
+          const wx0=(0.5-lm[0].x)*xScale, wy0=(1-lm[0].y)*yScale+yOff;
+          const wxM=(0.5-lm[9].x)*xScale, wyM=(1-lm[9].y)*yScale+yOff;
+          const tiltZ=(lm[9].z-lm[0].z)*22.0;
+          const rawDir=new THREE.Vector3(wxM-wx0,wyM-wy0,tiltZ).normalize();
+          const side=isRight?'right':'left';
+          // raw 목표값 저장 (보간 안 함)
+          if(!s[side])s[side]={pos:new THREE.Vector3(tx,ty,0),dir:rawDir.clone(),vel:new THREE.Vector3(),targetPos:new THREE.Vector3(tx,ty,0),targetDir:rawDir.clone(),graceCount:0};
+          else{s[side].targetPos.set(tx,ty,0);s[side].targetDir.copy(rawDir);}
+          s[side].graceCount=0;
+          if(isRight)gotR=true;else gotL=true;
         }
       }
-      // LERP 낮춤: 더 빠르고 즉각적인 반응 (댄스 느낌)
-      const LERP=0.82;
-      const GRACE_FRAMES=18;
-      const grace=graceRef.current;
-      const smooth=(prev,next,side)=>{
-        if(!next){
-          if(prev&&grace[side]<GRACE_FRAMES){grace[side]++;return prev;}
-          grace[side]=0;return null;
+      // grace 카운터 증가 (못 잡은 손)
+      const GRACE_MAX=50;
+      for(const side of['left','right']){
+        if(side==='left'&&gotL)continue;
+        if(side==='right'&&gotR)continue;
+        if(s[side]){
+          s[side].graceCount=(s[side].graceCount??0)+1;
+          if(s[side].graceCount>GRACE_MAX)s[side]=null;
         }
-        grace[side]=0;
-        if(!prev)return{pos:next.pos.clone(),dir:next.dir.clone(),vel:new THREE.Vector3()};
-        const vel=new THREE.Vector3().subVectors(next.pos,prev.pos).divideScalar(dt);
-        // 위치는 빠르게, 방향은 조금 부드럽게
-        next.pos.lerpVectors(prev.pos,next.pos,LERP);
-        next.dir.lerpVectors(prev.dir,next.dir,0.55).normalize();
-        next.vel=vel;
-        return next;
-      };
-      s.left=smooth(s.left,nL,'left');
-      s.right=smooth(s.right,nR,'right');
+      }
     }
 
     setup();
@@ -333,41 +615,61 @@ const _UP=new THREE.Vector3(0,1,0);
 
 function Saber({type,handDataRef}){
   const grp=useRef(),glowRef=useRef(),coreRef=useRef();
-  const trailMeshes=useRef([]);
   const col=type==='left'?COL.left:COL.right;
   const L=2.4;
+  // 보간용 현재값 (useFrame에서 매 프레임 dt 기반으로 업데이트)
   const sPos=useRef(new THREE.Vector3(type==='left'?-2.0:2.0,0.8,0));
   const sQ=useRef(new THREE.Quaternion());
   const swingAcc=useRef(0),lastSwingT=useRef(0);
-  const visibleFrames=useRef(0);
-  const prevPositions=useRef([]);
+  const hideTimer=useRef(0); // 손 없을 때 카운트다운
   const idleT=useRef(0);
+  const prevPos=useRef(new THREE.Vector3());
 
   useFrame((_,dt)=>{
     if(!grp.current)return;
     const data=type==='left'?handDataRef.current.left:handDataRef.current.right;
     if(data){
-      visibleFrames.current=Math.min(visibleFrames.current+1,10);
+      hideTimer.current=0.55; // 손 잡히면 타이머 리셋
       grp.current.visible=true;
-      // 더 빠른 위치 추적
-      sPos.current.lerp(data.pos,0.78);
+
+      // ── 위치 보간: 지수 감쇠 (프레임레이트 독립적) ──
+      // halfLife: 목표까지 절반 거리 도달 시간(초). 작을수록 빠름
+      const dist=sPos.current.distanceTo(data.targetPos);
+      // 거리 멀수록 halfLife 짧게 (더 빠르게 따라감)
+      const posHalfLife=Math.max(0.022, 0.065-dist*0.012);
+      const posAlpha=1-Math.pow(0.5, dt/posHalfLife);
+      sPos.current.lerp(data.targetPos, posAlpha);
       grp.current.position.copy(sPos.current);
-      const targetQ=new THREE.Quaternion().setFromUnitVectors(_UP,data.dir);
-      sQ.current.slerp(targetQ,0.55);
+      // 히트 판정용 pos 동기화
+      data.pos.copy(sPos.current);
+
+      // ── 방향 보간: 각도 거리 기반 halfLife ──
+      const targetQ=new THREE.Quaternion().setFromUnitVectors(_UP,data.targetDir);
+      const angleDiff=sQ.current.angleTo(targetQ);
+      const rotHalfLife=Math.max(0.018, 0.055-angleDiff*0.008);
+      const rotAlpha=1-Math.pow(0.5, dt/rotHalfLife);
+      sQ.current.slerp(targetQ, rotAlpha);
       grp.current.quaternion.copy(sQ.current);
-      const spd=data.vel?.length()??0;
-      swingAcc.current=THREE.MathUtils.lerp(swingAcc.current,Math.min(spd*0.08,1),0.45);
-      const glow=2.8+swingAcc.current*18;
+      // dir 동기화
+      data.dir.set(0,1,0).applyQuaternion(sQ.current).normalize();
+
+      // ── 스윙 글로우 ──
+      const frameVel=new THREE.Vector3().subVectors(sPos.current,prevPos.current).divideScalar(Math.max(dt,0.001));
+      data.vel=frameVel;
+      prevPos.current.copy(sPos.current);
+      const spd=frameVel.length();
+      swingAcc.current=THREE.MathUtils.lerp(swingAcc.current,Math.min(spd*0.07,1),0.35);
+      const glow=2.8+swingAcc.current*16;
       if(glowRef.current)glowRef.current.material.emissiveIntensity=glow;
       if(coreRef.current)coreRef.current.material.emissiveIntensity=glow*0.6;
       const now=performance.now();
-      if(spd>3.0&&now-lastSwingT.current>120){lastSwingT.current=now;playSwing();}
+      if(spd>2.5&&now-lastSwingT.current>110){lastSwingT.current=now;playSwing();}
       idleT.current=0;
     }else{
-      visibleFrames.current=Math.max(visibleFrames.current-1,0);
-      if(visibleFrames.current===0)grp.current.visible=false;
-      swingAcc.current*=0.82;
-      // idle float animation
+      // 손 없을 때: 타이머 소진 후 숨김
+      hideTimer.current=Math.max(0,hideTimer.current-dt);
+      if(hideTimer.current<=0)grp.current.visible=false;
+      swingAcc.current*=0.85;
       idleT.current+=dt;
       const fx=Math.sin(idleT.current*1.3)*(type==='left'?-0.04:0.04);
       const fy=Math.sin(idleT.current*0.9)*0.03;
@@ -420,11 +722,6 @@ function Saber({type,handDataRef}){
       <mesh ref={coreRef} position={[0,0.09+L/2,0]}>
         <capsuleGeometry args={[0.024,L,6,10]}/>
         <meshStandardMaterial color="white" emissive={col} emissiveIntensity={1.8} toneMapped={false} transparent opacity={0.75}/>
-      </mesh>
-      {/* 블레이드 끝 발광 */}
-      <mesh position={[0,0.09+L+0.05,0]}>
-        <sphereGeometry args={[0.05,8,8]}/>
-        <meshBasicMaterial color="white" toneMapped={false}/>
       </mesh>
       <pointLight color={col} intensity={6} distance={7} decay={2} position={[0,1.4,0]}/>
       <pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>
@@ -516,96 +813,116 @@ function ExpandRing({color,speed,maxR,life,axis='z'}){
   );
 }
 
-function HitEffect({color,tsh,isGood,isPenalty}){
+// tsh를 자체 계산하는 단순 구체 메시
+function TshMesh({color,opacity0,scale0,life,hitTime,playStartRef,back=false}){
+  const r=useRef();
+  useFrame(()=>{
+    if(!r.current)return;
+    const tsh=(performance.now()-playStartRef.current)/1000-hitTime;
+    const op=Math.max(0,opacity0-tsh*(opacity0/life));
+    if(r.current.material)r.current.material.opacity=op;
+    r.current.visible=tsh<life&&tsh>=0;
+  });
+  return(
+    <mesh ref={r}>
+      <sphereGeometry args={[scale0,8,8]}/>
+      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={opacity0} side={back?THREE.BackSide:THREE.FrontSide}/>
+    </mesh>
+  );
+}
+// 빛줄기 컴포넌트
+function GlowRay({rot,color,hitTime,playStartRef}){
+  const r=useRef();
+  useFrame(()=>{
+    if(!r.current)return;
+    const tsh=(performance.now()-playStartRef.current)/1000-hitTime;
+    const sc=Math.max(0.01,1-tsh*5.5);
+    r.current.scale.set(1,sc,1);
+    if(r.current.material)r.current.material.opacity=Math.max(0,0.9-tsh*6);
+    r.current.visible=tsh<0.4&&tsh>=0;
+  });
+  return(
+    <mesh ref={r} rotation={[0,0,rot]}>
+      <boxGeometry args={[0.05,3.2,0.04]}/>
+      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={0.9}/>
+    </mesh>
+  );
+}
+
+// 불꽃 스파크 이펙트 — 베었을 때 불꽃이 튀듯
+// geometry 캐싱
+const _sparkGeo=new THREE.PlaneGeometry(1,1); // scale로 조절
+
+function Spark({dx,dy,speed,color,life,delay=0}){
+  const r=useRef();
+  useFrame((_,dt)=>{
+    if(!r.current)return;
+    const t=(r.current.userData.t=(r.current.userData.t??-delay)+dt);
+    if(t<0){r.current.visible=false;return;}
+    if(t>life){r.current.visible=false;return;}
+    r.current.visible=true;
+    const f=t/life;
+    // 초반 빠르게 튀고 중력으로 낙하
+    const ease=Math.pow(1-f,0.4); // 감속
+    const grav=-8*t*t;
+    r.current.position.set(dx*speed*ease*t, dy*speed*ease*t+grav, (Math.random()-0.5)*0.05);
+    // 가늘고 긴 스파크 모양 (방향 따라 회전)
+    r.current.rotation.z=Math.atan2(dy,dx)+Math.PI/2;
+    const w=Math.max(0.001,0.012*(1-f*f));
+    const h=Math.max(0.001,(0.08+0.12*ease)*(1-f*1.2));
+    r.current.scale.set(w,h,1);
+    if(r.current.material)r.current.material.opacity=Math.max(0,1-f*f*1.6);
+  });
+  return(
+    <mesh ref={r} geometry={_sparkGeo}>
+      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/>
+    </mesh>
+  );
+}
+
+// 순간 플래시 디스크 (geometry 캐싱)
+const _flashGeo=new THREE.CircleGeometry(1,12);
+function FlashDisc({color,hitTime,playStartRef}){
+  const r=useRef();
+  useFrame(()=>{
+    if(!r.current)return;
+    const tsh=(performance.now()-playStartRef.current)/1000-hitTime;
+    const f=tsh/0.12;
+    if(tsh<0||tsh>0.12){r.current.visible=false;return;}
+    r.current.visible=true;
+    r.current.scale.setScalar(0.15+f*0.55);
+    if(r.current.material)r.current.material.opacity=Math.max(0,0.75*(1-f*f));
+  });
+  return(
+    <mesh ref={r} geometry={_flashGeo}>
+      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={0.75}/>
+    </mesh>
+  );
+}
+
+function HitEffect({color,hitTime,playStartRef,isGood,isPenalty}){
   const g=useRef();
-  const life=isGood?0.9:0.55;
-  useFrame(()=>{if(g.current)g.current.visible=tsh<life;});
-
-  if(!isGood&&!isPenalty){
-    // 오답+색일치 — 회색 미니 버스트
-    return(
-      <group ref={g}>
-        <mesh><sphereGeometry args={[0.25,8,8]}/><meshBasicMaterial color="#666" toneMapped={false} transparent opacity={Math.max(0,0.6-tsh*6)}/></mesh>
-        {BAD_DIRS.slice(0,6).map(([dx,dy],i)=>(
-          <Particle key={i} dx={dx} dy={dy} speed={3.5} size={0.055} color="#999" life={0.5} gravity={false}/>
-        ))}
-      </group>
-    );
-  }
-
-  if(isPenalty){
-    // 감점 — 붉은 X 파편
-    return(
-      <group ref={g}>
-        <mesh><sphereGeometry args={[0.3,8,8]}/><meshBasicMaterial color="#ff2222" toneMapped={false} transparent opacity={Math.max(0,0.8-tsh*7)}/></mesh>
-        {BAD_DIRS.map(([dx,dy],i)=>(
-          <Particle key={i} dx={dx} dy={dy} speed={5} size={0.07} color={i%2===0?'#ff4444':'#ff9999'} life={0.5}/>
-        ))}
-      </group>
-    );
-  }
-
-  // ── 정답 타격 — 풀 버스트 ──
+  const life=0.65;
+  useFrame(()=>{
+    if(!g.current)return;
+    const tsh=(performance.now()-playStartRef.current)/1000-hitTime;
+    g.current.visible=tsh<life&&tsh>=0;
+  });
+  const col=isPenalty?'#ff6600':isGood?color:'#cc8800';
+  const cnt=isGood?26:12; // 스파크 수 늘림
+  const sparks=useMemo(()=>Array.from({length:cnt},(_,i)=>{
+    const a=(i/cnt)*Math.PI*2+(Math.random()-0.5)*0.3;
+    const spd=isGood?(7+Math.random()*9):(4+Math.random()*5); // 더 빠르고 넓게
+    // 색상: 흰색/노란/주황/본색 믹스
+    const palette=['#ffffff','#ffe566','#ffaa22',col];
+    const c=palette[i%palette.length];
+    return{dx:Math.cos(a),dy:Math.sin(a),speed:spd,color:c,
+      life:0.22+Math.random()*0.28, delay:i*0.005};
+  }),[]);
   return(
     <group ref={g}>
-      {/* 중심 섬광 — 빠르게 팽창 후 소멸 */}
-      <mesh><sphereGeometry args={[0.85,12,12]}/><meshBasicMaterial color="white" toneMapped={false} transparent opacity={Math.max(0,1-tsh*14)}/></mesh>
-      <mesh><sphereGeometry args={[0.5,10,10]}/><meshBasicMaterial color={color} toneMapped={false} transparent opacity={Math.max(0,0.95-tsh*9)}/></mesh>
-
-      {/* 팽창 링 3개 (xy,xz,yz 축 혼합) */}
-      <ExpandRing color={color} speed={14} maxR={0.5} life={0.7} axis='z'/>
-      <ExpandRing color="white" speed={9} maxR={0.4} life={0.55} axis='x'/>
-      <ExpandRing color={color} speed={18} maxR={0.35} life={0.5} axis='y'/>
-
-      {/* 메인 파티클 — 사방으로 빠르게 튀는 구슬 (18개) */}
-      {GOOD_DIRS.map(([dx,dy],i)=>(
-        <Particle key={`p${i}`}
-          dx={dx} dy={dy}
-          speed={8+i%4*1.5}
-          size={i%3===0?0.13:0.085}
-          color={i%3===0?'white':i%3===1?color:'#fffde0'}
-          life={0.75}
-          gravity={true}
-          delay={i%4*0.01}
-        />
-      ))}
-
-      {/* 별 스파크 — 가장 빠르게 튀는 빛 조각 (12개) */}
-      {Array.from({length:12}).map((_,i)=>(
-        <StarSpark key={`s${i}`}
-          angle={(i/12)*Math.PI*2+(Math.PI/24)}
-          speed={6+i%3*1.5}
-          color={i%2===0?color:'#ffffff'}
-          life={0.65}
-          size={i%4===0?0.11:0.075}
-        />
-      ))}
-
-      {/* X자 빛줄기 (4방향) — 순간 팽창 */}
-      {[0,Math.PI/4,Math.PI/2,Math.PI*3/4].map((rot,i)=>{
-        const R=()=>{
-          const r=useRef();
-          useFrame(()=>{
-            if(!r.current)return;
-            const sc=Math.max(0.01,1-tsh*5.5);
-            r.current.scale.set(1,sc,1);
-            if(r.current.material)r.current.material.opacity=Math.max(0,0.9-tsh*6);
-          });
-          return(
-            <mesh ref={r} rotation={[0,0,rot]}>
-              <boxGeometry args={[0.05,3.2,0.04]}/>
-              <meshBasicMaterial color={i%2===0?color:'#ffffff'} toneMapped={false} transparent opacity={0.9}/>
-            </mesh>
-          );
-        };
-        return<R key={`r${i}`}/>;
-      })}
-
-      {/* 후광 플레어 — 가장 오래 남는 글로우 */}
-      <mesh>
-        <sphereGeometry args={[1.1,8,8]}/>
-        <meshBasicMaterial color={color} toneMapped={false} transparent opacity={Math.max(0,0.18-tsh*1.8)} side={THREE.BackSide}/>
-      </mesh>
+      <FlashDisc color={col} hitTime={hitTime} playStartRef={playStartRef}/>
+      {sparks.map((s,i)=><Spark key={i} {...s}/>)}
     </group>
   );
 }
@@ -656,7 +973,8 @@ function SliceEffect({color,edgeCol,startPos,noteType}){
       botRef.current.material.opacity=fade*0.95;
     }
     // 절단선 페이드
-    if(lineRef.current)lineRef.current.material.opacity=Math.max(0,fade*2.5-1.5);
+    // 절단선: 0.08초 안에 빠르게 사라짐
+    if(lineRef.current)lineRef.current.material.opacity=Math.max(0,1-p.t*14);
   });
 
   const sliceH=PH*0.5;
@@ -671,9 +989,9 @@ function SliceEffect({color,edgeCol,startPos,noteType}){
         <boxGeometry args={[PW,sliceH,PD]}/>
         <meshStandardMaterial color={bodyCol} emissive={color} emissiveIntensity={0.55} transparent opacity={0.9}/>
       </mesh>
-      {/* 절단면 빛줄기 */}
+      {/* 절단면 빛줄기 — 얇고 빠르게 사라지는 슬래시 선 */}
       <mesh ref={lineRef} position={[0,0,PD/2+0.012]}>
-        <planeGeometry args={[PW,0.06]}/>
+        <planeGeometry args={[PW*1.3,0.022]}/>
         <meshBasicMaterial color="white" toneMapped={false} transparent opacity={1}/>
       </mesh>
     </group>
@@ -681,34 +999,51 @@ function SliceEffect({color,edgeCol,startPos,noteType}){
 }
 
 // ══════════════════════════════════════
-// NoteComp
+// NoteComp — useFrame으로 매 프레임 위치 업데이트 (끊김 제거)
 // ══════════════════════════════════════
 const panelGeo=new THREE.BoxGeometry(PW,PH,PD);
 const edgesGeo=new THREE.EdgesGeometry(panelGeo);
 
-function NoteComp({data,zPos,currentTime,multRef}){
+function NoteComp({data,playStartRef,multRef}){
+  const grp=useRef();
   const mult=multRef.current;
   const isHeart=data.noteType==='heart';
   const isCorrect=!isHeart&&data.numVal!==0&&data.numVal%mult===0;
   const noteColor=data.type==='left'?COL.left:COL.right;
-  const edgeCol=isCorrect?COL.correct:noteColor;
+  const edgeCol=noteColor; // 테두리는 항상 노트 색 (빨강/파랑만)
+  const nx=LANE_X[data.lineIndex], ny=LAYER_Y[data.lineLayer];
+  const hitTimeRef=useRef(null);
+  const visRef=useRef(true);
 
-  const pos=useMemo(()=>[LANE_X[data.lineIndex],LAYER_Y[data.lineLayer],zPos],[data.lineIndex,data.lineLayer,zPos]);
+  useFrame(()=>{
+    if(!grp.current)return;
+    const time=(performance.now()-playStartRef.current)/1000;
+    const cz=PLAYER_Z-(data.time-time)*NOTE_SPEED;
+    // 히트된 경우: 히트 이펙트 위치 고정
+    if(data.hit){
+      if(hitTimeRef.current===null)hitTimeRef.current=time;
+      grp.current.position.set(nx,ny,cz);
+      return;
+    }
+    if(data.missed){grp.current.visible=false;return;}
+    grp.current.visible=true;
+    grp.current.position.set(nx,ny,cz);
+  });
+
   if(data.missed)return null;
+
   if(data.hit&&data.hitTime!=null){
-    const tsh=currentTime-data.hitTime;
-    const showSlice=tsh<1.1&&!isHeart;
-    const showHitFx=tsh<(isCorrect||isHeart?0.85:0.52);
-    return<group position={pos}>
-      {showSlice&&<SliceEffect color={noteColor} edgeCol={edgeCol} startPos={new THREE.Vector3(0,0,0)} noteType={data.type}/>}
-      {showHitFx&&<HitEffect color={edgeCol} tsh={tsh} isGood={isCorrect||isHeart} isPenalty={data.isPenalty}/>}
-    </group>;
+    return(
+      <group ref={grp} position={[nx,ny,0]}>
+        {!isHeart&&<SliceEffect color={noteColor} edgeCol={edgeCol} startPos={new THREE.Vector3(0,0,0)} noteType={data.type} hitTime={data.hitTime} playStartRef={playStartRef}/>}
+        <HitEffect color={edgeCol} hitTime={data.hitTime} playStartRef={playStartRef} isGood={isCorrect||isHeart} isPenalty={data.isPenalty}/>
+      </group>
+    );
   }
 
   if(isHeart){
-    // 하트: 순수 핑크 빛나는 하트만
     return(
-      <group position={pos}>
+      <group ref={grp} position={[nx,ny,0]}>
         <mesh geometry={panelGeo}>
           <meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6}
             emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>
@@ -724,23 +1059,19 @@ function NoteComp({data,zPos,currentTime,multRef}){
   }
 
   return(
-    <group position={pos}>
-      {/* 유리질 반투명 패널 */}
+    <group ref={grp} position={[nx,ny,0]}>
       <mesh geometry={panelGeo}>
         <meshStandardMaterial
           color={noteColor} roughness={0.05} metalness={0.15}
           emissive={noteColor} emissiveIntensity={0.22}
           transparent opacity={0.38}/>
       </mesh>
-      {/* 앞면 광택 레이어 */}
       <mesh position={[0,0,PD/2+0.002]}>
         <planeGeometry args={[PW*0.92,PH*0.92]}/>
         <meshBasicMaterial color="white" transparent opacity={0.07}/>
       </mesh>
-      {/* 숫자 */}
       <Text position={[0,0,PD/2+0.022]} fontSize={PH*0.52} color="#ffffff" anchorX="center" anchorY="middle"
           outlineColor={edgeCol} outlineWidth={isCorrect?0.04:0.022}>{data.numVal}</Text>
-      {/* 테두리 엣지 */}
       <lineSegments geometry={edgesGeo}>
         <lineBasicMaterial color={edgeCol} toneMapped={false}/>
       </lineSegments>
@@ -756,17 +1087,26 @@ const obsGeoH=new THREE.BoxGeometry(5.4,0.65,0.45);
 const obsGeoV=new THREE.BoxGeometry(0.65,4.2,0.45);
 const obsConeGeo=new THREE.ConeGeometry(0.38,0.65,3);
 
-function ObsComp({data,zPos}){
+function ObsComp({data,playStartRef}){
+  const grpRef=useRef();
   const mRef=useRef();
-  useFrame(s=>{if(mRef.current)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;});
   const col=COL.obstacle;
+  const baseX=data.obstacleType==='top'?0:data.obstacleType==='left'?-2.8:2.8;
+  const baseY=data.obstacleType==='top'?3.1:1.7;
+  useFrame((s)=>{
+    if(mRef.current)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;
+    if(grpRef.current){
+      const time=(performance.now()-playStartRef.current)/1000;
+      const cz=PLAYER_Z-(data.time-time)*NOTE_SPEED;
+      grpRef.current.position.set(baseX,baseY,cz);
+    }
+  });
   const ObsMat=()=><meshStandardMaterial ref={mRef} color={col} emissive={col}
     emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>;
   const EdgeMat=()=><meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>;
   if(data.obstacleType==='top')return(
-    <group position={[0,3.1,zPos]}>
+    <group ref={grpRef} position={[baseX,baseY,0]}>
       <mesh geometry={obsGeoH}><ObsMat/></mesh>
-      {/* 엣지 와이어프레임 강조 */}
       <lineSegments geometry={new THREE.EdgesGeometry(obsGeoH)}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
       </lineSegments>
@@ -775,7 +1115,7 @@ function ObsComp({data,zPos}){
     </group>
   );
   if(data.obstacleType==='left')return(
-    <group position={[-2.8,1.7,zPos]}>
+    <group ref={grpRef} position={[baseX,baseY,0]}>
       <mesh geometry={obsGeoV}><ObsMat/></mesh>
       <lineSegments geometry={new THREE.EdgesGeometry(obsGeoV)}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
@@ -785,7 +1125,7 @@ function ObsComp({data,zPos}){
     </group>
   );
   return(
-    <group position={[2.8,1.7,zPos]}>
+    <group ref={grpRef} position={[baseX,baseY,0]}>
       <mesh geometry={obsGeoV}><ObsMat/></mesh>
       <lineSegments geometry={new THREE.EdgesGeometry(obsGeoV)}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
@@ -842,25 +1182,25 @@ function WebcamPreview({videoRef,resultsRef,isCameraReady}){
 // ══════════════════════════════════════
 function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
                     chartRef,multRef,playStartRef,
-                    onNoteHit,onNoteMiss,onObstacleHit,onMultChange}){
+                    onNoteHit,onNoteMiss,onObstacleHit,onMultChange,
+                    onWallStart,onWallHit,onWallBreak,onWallTimeout,wallRef}){
   const[tick,setTick]=useState(0);
   const bump=useCallback(()=>setTick(t=>t+1),[]);
-  const[ct,setCt]=useState(0);
-  const anRef=useRef([]),aoRef=useRef([]),niRef=useRef(0),oiRef=useRef(0);
+  const ctRef=useRef(0); // 실시간 게임시간 ref — state 지연 없음
+  const[ctDisplay,setCtDisplay]=useState(0); // 렌더용 (낮은 빈도로 업데이트)
   const shk=useRef(0),camRef=useRef(),ambRef=useRef(),spotRef=useRef();
   const lmcRef=useRef(0),obsCool=useRef(0),ctTs=useRef(0);
+  const lastWallScoreRef=useRef(0); // 마지막 벽 이벤트 점수 기준
 
   // 게임 리셋
   useEffect(()=>{
-    anRef.current=[];aoRef.current=[];niRef.current=0;oiRef.current=0;
-    lmcRef.current=0;obsCool.current=0;setCt(0);bump();
-  // chartRef 자체는 바뀌지 않음, 내용물만 바뀜
-  // eslint-disable-next-line
-  },[]);// mount 한 번만
+    ctRef.current=0;
+    lmcRef.current=0;obsCool.current=0;setCtDisplay(0);bump();
+  },[]);
 
   useFrame((_,dt)=>{
     if(gameStatus===GS.PLAYING){
-      const pulse=Math.pow(1-((ct%BEAT)/BEAT),4);
+      const pulse=Math.pow(1-((ctRef.current%BEAT)/BEAT),4);
       if(ambRef.current)ambRef.current.intensity=0.1+pulse*0.19;
       if(spotRef.current)spotRef.current.intensity=0.32+pulse*0.95;
     }
@@ -871,24 +1211,25 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       if(shk.current<0.01){shk.current=0;camRef.current.position.set(0,1.8,4);}
     }
     if(gameStatus!==GS.PLAYING||!audioRef.current)return;
-    // 실제 경과 게임시간 (오디오 루프와 무관)
     const time=(performance.now()-playStartRef.current)/1000;
+    ctRef.current=time; // 매 프레임 즉시 갱신
     const now=performance.now();
-    if(now-ctTs.current>14){ctTs.current=now;setCt(time);}
+    if(now-ctTs.current>33){ctTs.current=now;setCtDisplay(time);} // 렌더용은 33ms마다(~30fps)
 
-    // ── 무한 노트 스트리밍: 항상 현재+12초 앞까지 생성 ──
+    // ── 무한 노트 스트리밍 (벽 이벤트 중엔 중단) ──
+    const wallActive=wallRef?.current?.pending||wallRef?.current?.state==='approaching'||wallRef?.current?.state==='stopped';
     const STREAM_AHEAD=12;
-    if(time+STREAM_AHEAD>chartRef.current.genUntil){
+    if(!wallActive && time+STREAM_AHEAD>chartRef.current.genUntil){
       const fromT=chartRef.current.genUntil;
       const toT=fromT+STREAM_AHEAD+4;
       const newData=generateNotesInRange(fromT,toT,multRef.current);
       chartRef.current.notes.push(...newData.notes);
       chartRef.current.obstacles.push(...newData.obstacles);
       chartRef.current.genUntil=toT;
+      bump();
     }
 
-    // ── 배수 변경: 시간 경과에 따라 간격이 줄어듦 ──
-    // 0~60s: 20초마다 / 60~120s: 12초마다 / 120s~: 5초마다
+    // ── 배수 변경 ──
     const multInterval=time<60?20:time<120?12:5;
     if(time-lmcRef.current>multInterval){
       lmcRef.current=time;
@@ -896,97 +1237,116 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       do{newMult=MULT_OPTS[Math.floor(Math.random()*MULT_OPTS.length)];}
       while(newMult===multRef.current&&MULT_OPTS.length>1);
       multRef.current=newMult;
-      // 아직 화면에 없는(앞으로 나올) 노트만 재배정
       const ahead=Math.abs(SPAWN_Z-PLAYER_Z)/NOTE_SPEED;
       reassignNums(chartRef.current.notes.filter(n=>n.time>time+ahead*0.5),newMult);
       onMultChange(newMult);
       bump();
     }
 
-    // ── 메모리 정리: 오래된 노트/장애물 제거 (time-5초 이전) ──
-    if(Math.floor(time)%10===0&&Math.floor(time)!==Math.floor(time-dt)){
-      const cutoff=time-5;
-      chartRef.current.notes=chartRef.current.notes.filter(n=>n.time>cutoff||(!n.hit&&!n.missed));
+    // ── 메모리 정리: 완전히 지나간(hit or missed) 오래된 노트 제거 ──
+    if(Math.floor(time*0.2)!==Math.floor((time-dt)*0.2)){
+      const cutoff=time-12;
+      chartRef.current.notes=chartRef.current.notes.filter(n=>n.time>cutoff);
       chartRef.current.obstacles=chartRef.current.obstacles.filter(o=>o.time>cutoff);
     }
 
-    const ahead=Math.abs(SPAWN_Z-PLAYER_Z)/NOTE_SPEED;
-    const ns=chartRef.current.notes,os=chartRef.current.obstacles;
-    while(niRef.current<ns.length){const n=ns[niRef.current];if(n.time-ahead<=time){anRef.current.push(n);niRef.current++;}else break;}
-    while(oiRef.current<os.length){const o=os[oiRef.current];if(o.time-ahead<=time){aoRef.current.push(o);oiRef.current++;}else break;}
-
     const hd=handDataRef.current;
-    const lPos=hd.left?.pos??null,rPos=hd.right?.pos??null;
-    const lVel=hd.left?.vel??null,rVel=hd.right?.vel??null;
+    const lHand=hd.left??null,rHand=hd.right??null;
     const head=headPositionRef.current;
     const mult=multRef.current;
 
-    // ── 노트 충돌 ──
-    // 판정 규칙:
-    // 1. 숫자 정답(배수 O) → 양손 모두 타격 가능
-    // 2. 숫자 오답(배수 X) → 어떤 손으로도 칠 수 있지만 감점(isPenalty)
-    // 3. 장애물은 손으로 절대 타격 불가 (머리만)
-    const HIT_R=PW*0.5+0.52; // ~0.93
-    for(let i=anRef.current.length-1;i>=0;i--){
-      const n=anRef.current[i];if(n.hit||n.missed)continue;
+    // ── 광선검 히트 판정 ──
+    // XY만 체크 (Z는 판정창으로 별도 처리) — 블레이드 선분과 노트 XY 거리
+    const POMMEL_OFF=-0.37;
+    const TIP_OFF=2.49;
+    const HIT_R=0.92;    // XY 히트 반경 (조금 넉넉하게)
+    const HIT_WIN=3.5;   // 판정창 Z 범위 (플레이어 앞뒤)
+
+    function bladeHit(hand, nx, ny){
+      if(!hand)return false;
+      const {pos,dir}=hand;
+      // 블레이드를 XY 평면 선분으로 투영해서 거리 계산
+      const bx0=pos.x+dir.x*POMMEL_OFF, by0=pos.y+dir.y*POMMEL_OFF;
+      const bx1=pos.x+dir.x*TIP_OFF,   by1=pos.y+dir.y*TIP_OFF;
+      const dxB=bx1-bx0, dyB=by1-by0;
+      const lenSq=dxB*dxB+dyB*dyB;
+      let t2=0;
+      if(lenSq>0.0001) t2=Math.max(0,Math.min(1,((nx-bx0)*dxB+(ny-by0)*dyB)/lenSq));
+      const cx2=bx0+t2*dxB, cy2=by0+t2*dyB;
+      return Math.sqrt((cx2-nx)**2+(cy2-ny)**2)<HIT_R;
+    }
+
+    let anyChange=false;
+    const notes=chartRef.current.notes;
+    for(let i=0;i<notes.length;i++){
+      const n=notes[i];
+      if(n.hit||n.missed)continue;
       const cz=PLAYER_Z-(n.time-time)*NOTE_SPEED;
-      if(cz>MISS_Z){
-        n.missed=true;
-        const isCorrect=n.noteType==='heart'||(n.numVal!==0&&n.numVal%mult===0);
-        if(isCorrect)onNoteMiss(n);
-        anRef.current.splice(i,1);bump();continue;
-      }
-      if(cz>PLAYER_Z-2.8&&cz<PLAYER_Z+1.6){
+      if(cz<PLAYER_Z-7.0)continue;
+      if(cz>MISS_Z){n.missed=true;onNoteMiss(n);anyChange=true;continue;}
+      // 판정창 안에 있을 때만 히트 체크
+      if(cz>PLAYER_Z-HIT_WIN&&cz<PLAYER_Z+HIT_WIN){
         const nx=LANE_X[n.lineIndex],ny=LAYER_Y[n.lineLayer];
         const isCorrect=n.noteType==='heart'||(n.numVal!==0&&n.numVal%mult===0);
         let hitHand=null,hitVel=null;
-        for(const[hp,hv,side]of[[lPos,lVel,'left'],[rPos,rVel,'right']]){
-          if(!hp)continue;
-          if(Math.abs(hp.x-nx)<HIT_R&&Math.abs(hp.y-ny)<HIT_R){
-            hitHand=side;hitVel=hv;break;
-          }
+        for(const[hand,side]of[[lHand,'left'],[rHand,'right']]){
+          if(bladeHit(hand,nx,ny)){hitHand=side;hitVel=hand?.vel;break;}
         }
         if(hitHand!==null){
           n.hit=true;n.hitTime=time;
           const colorMatch=(hitHand===n.type);
-          // 오답이고 색도 불일치면 isPenalty
-          const isPenalty=!isCorrect&&!colorMatch;
-          n.isPenalty=isPenalty;
-          if(isCorrect||colorMatch)shk.current=0.17;
-          else shk.current=0.08;
-          onNoteHit(n,isCorrect,colorMatch,(hitVel?.length()??0)>=0.5,isPenalty);
-          anRef.current.splice(i,1);bump();
+          n.isPenalty=!isCorrect&&!colorMatch;
+          shk.current=isCorrect||colorMatch?0.17:0.08;
+          onNoteHit(n,isCorrect,colorMatch,(hitVel?.length()??0)>=0.5,n.isPenalty);
+          anyChange=true;
         }
       }
     }
+    if(anyChange)bump();
 
-    // ── 장애물: 머리만 (손 충돌 없음) ──
+    // ── 장애물: chartRef.current.obstacles 직접 순회 ──
     if(obsCool.current>0)obsCool.current-=dt;
-    for(let i=aoRef.current.length-1;i>=0;i--){
-      const o=aoRef.current[i];if(o.hit)continue;
+    const obstacles=chartRef.current.obstacles;
+    for(let i=0;i<obstacles.length;i++){
+      const o=obstacles[i];
+      if(o.hit)continue;
       const cz=PLAYER_Z-(o.time-time)*NOTE_SPEED;
-      if(cz>MISS_Z+3){aoRef.current.splice(i,1);continue;}
-      if(cz>PLAYER_Z-2.5&&cz<PLAYER_Z+1.5&&head.detected&&obsCool.current<=0){
-        // top: 고개를 숙여야 → y > 0.48이면 숙인 것 (범위 완화)
-        // left: 오른쪽으로 피해야 → x > 0.52이면 피한 것
-        // right: 왼쪽으로 피해야 → x < 0.48이면 피한 것
-        const isMob=window.innerWidth<window.innerHeight;
-        const topThresh=isMob?0.50:0.48;
-        const sideThresh=isMob?0.45:0.44;
-        const hit=o.obstacleType==='top'  ? head.y<=topThresh
-                 :o.obstacleType==='left' ? head.x<=sideThresh
-                 :                          head.x>=(1-sideThresh);
-        if(hit){o.hit=true;obsCool.current=2.5;shk.current=0.85;onObstacleHit();aoRef.current.splice(i,1);}
+      if(cz<PLAYER_Z-2.5)continue;
+      // 판정 존 지나침: 자동 통과 (피한 것으로 간주)
+      if(cz>MISS_Z+1){o.hit=true;continue;}
+      if(cz<=PLAYER_Z+1.5&&obsCool.current<=0){
+        if(!head.detected){
+          // 얼굴 미감지 → 피한 것으로 간주 (페널티 없음)
+          o.hit=true; // 통과 처리
+        } else {
+          const isMob=window.innerWidth<window.innerHeight;
+          // top 장애물: 머리 안 숙이면(y가 작으면=화면 위쪽) 맞음
+          // left 장애물: 머리 오른쪽으로 안 피하면(x가 작으면=왼쪽에 있으면) 맞음
+          // right 장애물: 머리 왼쪽으로 안 피하면(x가 크면=오른쪽에 있으면) 맞음
+          const topThresh=isMob?0.52:0.50;   // y > 이 값이면 숙인 것
+          const sideThresh=isMob?0.42:0.40;  // left장애물: x > (1-sideThresh) 피한 것
+          const hit=o.obstacleType==='top'  ? head.y<topThresh   // 안 숙임
+                   :o.obstacleType==='left' ? head.x<(1-sideThresh) // 오른쪽으로 안 피함
+                   :                          head.x>(sideThresh);   // 왼쪽으로 안 피함
+          if(hit){o.hit=true;obsCool.current=2.5;shk.current=0.85;onObstacleHit();}
+          // 피한 경우: hit 처리 안 함 → 장애물이 그냥 지나쳐 사라짐
+        }
       }
     }
   });
 
-  const visNotes=useMemo(()=>
-    chartRef.current.notes.filter(n=>!n.missed&&(!n.hit||(ct-(n.hitTime??0))<1.2)&&n.time-ct<5.5&&n.time-ct>-2)
-  ,[tick,ct]);
-  const visObs=useMemo(()=>
-    chartRef.current.obstacles.filter(o=>!o.hit&&o.time-ct<5.5&&o.time-ct>-1)
-  ,[tick,ct]);
+  const visNotes=useMemo(()=>{
+    const ct=ctRef.current;
+    const wallOn=wallRef?.current?.state==='stopped'||wallRef?.current?.state==='approaching'||wallRef?.current?.state==='breaking';
+    if(wallOn)return[]; // 벽 이벤트 중 노트 완전 숨김
+    return chartRef.current.notes.filter(n=>!n.missed&&(!n.hit||(ct-(n.hitTime??0))<1.2)&&n.time-ct<5.5&&n.time-ct>-3);
+  },[tick,ctDisplay]);
+  const visObs=useMemo(()=>{
+    const ct=ctRef.current;
+    const wallOn=wallRef?.current?.state==='stopped'||wallRef?.current?.state==='approaching'||wallRef?.current?.state==='breaking';
+    if(wallOn)return[];
+    return chartRef.current.obstacles.filter(o=>!o.hit&&o.time-ct<5.5&&o.time-ct>-2.5);
+  },[tick,ctDisplay]);
 
   return(
     <>
@@ -1000,11 +1360,13 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       <mesh rotation={[-Math.PI/2,0,0]} position={[0,-0.01,0]}>
         <planeGeometry args={[4,80]}/><meshStandardMaterial color="#07070d" roughness={1} metalness={0}/>
       </mesh>
-      <Stars radius={40} depth={40} count={600} factor={3} saturation={0} fade speed={0.4}/>
+      <Stars radius={40} depth={40} count={350} factor={3} saturation={0} fade speed={0.4}/>
       <Saber type="left"  handDataRef={handDataRef}/>
       <Saber type="right" handDataRef={handDataRef}/>
-      {visNotes.map(n=><NoteComp key={n.id} data={n} zPos={PLAYER_Z-(n.time-ct)*NOTE_SPEED} currentTime={ct} multRef={multRef}/>)}
-      {visObs.map(o=><ObsComp key={o.id} data={o} zPos={PLAYER_Z-(o.time-ct)*NOTE_SPEED}/>)}
+      {visNotes.map(n=><NoteComp key={n.id} data={n} playStartRef={playStartRef} multRef={multRef}/>)}
+      {visObs.map(o=><ObsComp key={o.id} data={o} playStartRef={playStartRef}/>)}
+      {wallRef&&<WallComp wallRef={wallRef} playStartRef={playStartRef}
+        handDataRef={handDataRef} onWallHit={onWallHit} onWallBreak={onWallBreak} onWallTimeout={onWallTimeout}/>}
     </>
   );
 }
@@ -1019,6 +1381,157 @@ function ObsWarn({type}){
   const M={top:{t:'⬇️ 머리 숙여!',s:{top:'11%',left:'50%',transform:'translateX(-50%)'}},left:{t:'➡️ 오른쪽으로!',s:{top:'46%',left:'2%',transform:'translateY(-50%)'}},right:{t:'⬅️ 왼쪽으로!',s:{top:'46%',right:'2%',transform:'translateY(-50%)'}}};
   const{t,s}=M[type];
   return(<div style={{position:'absolute',...s,zIndex:25,pointerEvents:'none'}}><div style={{background:'rgba(234,88,12,.93)',color:'#fff',fontSize:'clamp(14px,3.5vw,21px)',fontWeight:900,padding:'9px 18px',borderRadius:12,border:'3px solid #fed7aa',boxShadow:'0 0 22px rgba(255,100,0,.75)',animation:'warnpulse .42s ease-in-out infinite',whiteSpace:'nowrap'}}>{t}</div></div>);
+}
+
+// ══════════════════════════════════════
+// HandButton — 손을 올려 1초 유지하면 버튼 실행
+// ══════════════════════════════════════
+function HandButton({label,onActivate,handDataRef,color='#2563eb',icon='▶'}){
+  const [hoverPct,setHoverPct]=useState(0);
+  const btnRef=useRef();
+  const timerRef=useRef(0);
+  const activeRef=useRef(false);
+  const firedRef=useRef(false);
+
+  useEffect(()=>{
+    firedRef.current=false;
+    timerRef.current=0;
+    setHoverPct(0);
+  },[label]);
+
+  useEffect(()=>{
+    if(!handDataRef)return;
+    let raf;
+    const HOLD_TIME=1.0; // 1초 유지
+    let lastT=performance.now();
+    function tick(){
+      raf=requestAnimationFrame(tick);
+      if(firedRef.current)return;
+      const btn=btnRef.current;
+      if(!btn)return;
+      const now=performance.now();
+      const dt=Math.min(0.05,(now-lastT)/1000);
+      lastT=now;
+      const rect=btn.getBoundingClientRect();
+      const hd=handDataRef.current;
+      const isMobile=window.innerWidth<window.innerHeight;
+      const xScale=isMobile?13.0:14.0;
+      const yScale=isMobile?8.5:8.0;
+      const yOff=isMobile?-1.2:-1.4;
+      const W=window.innerWidth, H=window.innerHeight;
+      // 버튼 영역을 넉넉하게 확장 (손 커서 크기 고려)
+      const PAD=40;
+      let hovering=false;
+      for(const side of['left','right']){
+        const hand=hd[side];
+        if(!hand)continue;
+        const tp=hand.targetPos??hand.pos;
+        if(!tp)continue;
+        const normX=0.5-tp.x/xScale;
+        const normY=1-(tp.y-yOff)/yScale;
+        const screenX=normX*W;
+        const screenY=normY*H;
+        if(screenX>=rect.left-PAD&&screenX<=rect.right+PAD&&
+           screenY>=rect.top-PAD&&screenY<=rect.bottom+PAD){
+          hovering=true;break;
+        }
+      }
+      if(hovering){
+        timerRef.current=Math.min(HOLD_TIME, timerRef.current+dt);
+        setHoverPct(timerRef.current/HOLD_TIME);
+        if(timerRef.current>=HOLD_TIME&&!firedRef.current){
+          firedRef.current=true;
+          onActivate();
+        }
+      } else {
+        timerRef.current=Math.max(0, timerRef.current-dt*1.8);
+        setHoverPct(timerRef.current/HOLD_TIME);
+      }
+    }
+    raf=requestAnimationFrame(tick);
+    return()=>cancelAnimationFrame(raf);
+  },[handDataRef,onActivate]);
+
+  const pct=Math.round(hoverPct*100);
+  const isHovering=hoverPct>0.02;
+  return(
+    <div ref={btnRef} style={{position:'relative',display:'inline-flex',alignItems:'center',
+      justifyContent:'center',cursor:'pointer',userSelect:'none'}}
+      onClick={onActivate}>
+      {/* 원형 진행 링 */}
+      {isHovering&&(
+        <svg style={{position:'absolute',top:-8,left:-8,right:-8,bottom:-8,
+          width:'calc(100% + 16px)',height:'calc(100% + 16px)',pointerEvents:'none'}}
+          viewBox="0 0 100 100">
+          <circle cx="50" cy="50" r="46" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="5"/>
+          <circle cx="50" cy="50" r="46" fill="none" stroke={color} strokeWidth="5"
+            strokeLinecap="round"
+            strokeDasharray={`${pct*2.89} 289`}
+            transform="rotate(-90 50 50)"
+            style={{transition:'stroke-dasharray 0.05s'}}/>
+        </svg>
+      )}
+      <button style={{background:isHovering?color:'rgba(255,255,255,.1)',
+        color:'#fff',fontWeight:700,
+        padding:'13px 38px',borderRadius:999,border:isHovering?'none':'1px solid rgba(255,255,255,.22)',
+        cursor:'pointer',display:'flex',alignItems:'center',gap:8,
+        boxShadow:isHovering?`0 0 28px ${color}`:'none',
+        transform:isHovering?'scale(1.06)':'scale(1)',
+        transition:'all 0.15s',fontSize:'clamp(14px,3.5vw,18px)'}}>
+        {icon} {label}
+      </button>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════
+// HandCursor — 게임 밖 화면에서 손 위치 표시
+// ══════════════════════════════════════
+function HandCursor({handDataRef}){
+  const [positions,setPositions]=useState([]);
+  useEffect(()=>{
+    const isMobile=window.innerWidth<window.innerHeight;
+    const xScale=isMobile?13.0:14.0;
+    const yScale=isMobile?8.5:8.0;
+    const yOff=isMobile?-1.2:-1.4;
+    let raf;
+    const tick=()=>{
+      raf=requestAnimationFrame(tick);
+      const W=window.innerWidth,H=window.innerHeight;
+      const hd=handDataRef.current;
+      const pts=[];
+      for(const side of['left','right']){
+        const hand=hd[side];
+        if(!hand)continue;
+        const tp=hand.targetPos??hand.pos;
+        if(!tp)continue;
+        const normX=0.5-tp.x/xScale;
+        const normY=1-(tp.y-yOff)/yScale;
+        const sx=normX*W, sy=normY*H;
+        if(sx>-50&&sx<W+50&&sy>-50&&sy<H+50)
+          pts.push({x:sx,y:sy,side});
+      }
+      setPositions(pts);
+    };
+    raf=requestAnimationFrame(tick);
+    return()=>cancelAnimationFrame(raf);
+  },[handDataRef]);
+  if(!positions.length)return null;
+  return(
+    <div style={{position:'fixed',inset:0,pointerEvents:'none',zIndex:55}}>
+      {positions.map((p,i)=>(
+        <div key={i} style={{position:'absolute',
+          left:p.x-14,top:p.y-14,width:28,height:28,
+          borderRadius:'50%',
+          background:p.side==='left'?'rgba(239,68,68,0.7)':'rgba(59,130,246,0.7)',
+          border:'2.5px solid #fff',
+          boxShadow:`0 0 12px ${p.side==='left'?'#ef4444':'#3b82f6'}`,
+          transform:'translate(0,0)',
+          transition:'left 0.04s,top 0.04s',
+        }}/>
+      ))}
+    </div>
+  );
 }
 
 // ══════════════════════════════════════
@@ -1039,13 +1552,16 @@ function App(){
   if(audioRef.current===null){const a=new Audio(SONG_URL);a.loop=true;audioRef.current=a;}
   const videoRef=useRef(null);
   const comboRef=useRef(0);
-  // multRef: GameScene에서 직접 읽는 ref (state 변경 없이 배수 변경)
   const multRef=useRef(5);
-  // chartRef: GameScene에서 직접 뮤테이션하는 채보
   const chartRef=useRef({notes:[],obstacles:[],genUntil:0});
-  // playTimeRef: 루프되는 오디오와 무관하게 실제 경과 게임시간 추적
   const playTimeRef=useRef(0);
   const playStartRef=useRef(0);
+  // 벽 이벤트
+  const wallRef=useRef({state:'idle',z:WALL_SPAWN_Z}); // state: idle/approaching/stopped/breaking
+  const[wallUI,setWallUI]=useState(null); // null | {hits, breaking}
+  const[wallWarning,setWallWarning]=useState(false);
+  const wallHitCountRef=useRef(0);
+  const lastWallScoreRef=useRef(0);
 
   const{isCameraReady,handDataRef,headPositionRef,lastResultsRef,error:camErr}=useMediaPipe(videoRef);
   useEffect(()=>{comboRef.current=combo;},[combo]);
@@ -1059,41 +1575,93 @@ function App(){
   // onNoteHit(note, isCorrect, colorMatch, fastEnough, isPenalty)
   const onHit=useCallback((note,isCorrect,colorMatch,fast,isPenalty)=>{
     if(note.noteType==='heart'){
-      playHeart();setHearts(h=>Math.min(MAX_HEARTS,h+1));showMsg('💖 +1 라이프!','#ec4899');setScore(s=>s+300);setCombo(c=>c+1);return;
-    }
-    const cb=comboRef.current;
-    const comboMult=cb>20?3:cb>10?2:1;
-    if(isPenalty){
-      // 오답+색불일치 = 감점 + 콤보 리셋
-      playMiss();
-      const penalty=150;
-      setScore(s=>Math.max(0,s-penalty));
-      setCombo(0);
-      showMsg(`❌ 오답! -${penalty}`,'#ff4444');
-      return;
+      playSaberSlice();playHeart();setHearts(h=>Math.min(MAX_HEARTS,h+1));showMsg('💖 +1 라이프!','#ec4899');setCombo(c=>c+1);return;
     }
     if(isCorrect&&colorMatch){
-      // 정답 + 색 일치 = 2배
-      playHit(true);const pts=600*comboMult;setScore(s=>s+pts);setCombo(c=>c+1);
-      showMsg(`🎯 ${note.numVal}=${multRef.current}의배수! +${pts}`,'#fbbf24');
+      playSaberSlice();playHit(true);setScore(s=>s+300);setCombo(c=>c+1);
+      showMsg(`🎯 +300 완벽!`,'#fbbf24');
     }else if(isCorrect){
-      // 정답 (색 불일치)
-      playHit(true);const pts=300*comboMult;setScore(s=>s+pts);setCombo(c=>c+1);
-      showMsg(`✓ ${note.numVal} = ${multRef.current}의 배수! +${pts}`,'#f59e0b');
+      playSaberSlice();playHit(true);setScore(s=>s+100);setCombo(c=>c+1);
+      showMsg(`✓ +100 정답!`,'#f59e0b');
+    }else if(colorMatch){
+      playSaberSlice();playHit(false);setScore(s=>s+50);
+      showMsg(`△ +50 색 일치`,(note.type==='left'?COL.left:COL.right));
     }else{
-      // 오답+색일치 = ¼ 점수 (색은 맞지만 숫자 오답)
-      playHit(false);const pts=Math.floor(75*comboMult);setScore(s=>s+pts);setCombo(c=>c+1);
-      showMsg(`△ ${note.numVal} 타격 +${pts}`,(note.type==='left'?COL.left:COL.right));
+      playMiss();setScore(s=>Math.max(0,s-50));setCombo(0);
+      showMsg(`❌ -50 오답!`,'#ff4444');
+      doDamage();
     }
-  },[showMsg]);
+  },[showMsg,doDamage]);
 
   const onMiss=useCallback((note)=>{
     playMiss();setCombo(0);
-    if(note.noteType==='heart'){doDamage();return;}
-    if(note.numVal!==0&&note.numVal%multRef.current===0)doDamage();
+    // 정답 배수 노트 또는 하트만 놓쳤을 때 하트 감소
+    // 오답(색만 같은 50점짜리 등) 노트를 놓쳐도 하트 안 빠짐
+    const isCorrect=note.noteType==='heart'||(note.numVal!==0&&note.numVal%multRef.current===0);
+    if(isCorrect)doDamage();
   },[doDamage]);
 
   const onObsHit=useCallback(()=>{setCombo(0);showMsg('💥 장애물 충돌!','#ff6600');doDamage();},[doDamage,showMsg]);
+
+  // 벽 이벤트 콜백
+  const onWallHit=useCallback((count)=>{
+    playHit(true);
+    setWallUI({hits:count,breaking:false});
+  },[]);
+
+  const onWallBreak=useCallback(()=>{
+    for(let i=0;i<WALL_HITS_NEEDED;i++){setCombo(c=>c+1);}
+    setScore(s=>s+2000);
+    showMsg('💥 벽 파괴! +2000','#f97316');
+    playWallBreak();
+    setWallUI({hits:WALL_HITS_NEEDED,breaking:true});
+    setTimeout(()=>{
+      wallRef.current={state:'idle'};
+      wallHitCountRef.current=0;
+      // 1초 뒤 노트 재개
+      const t=(performance.now()-playStartRef.current)/1000;
+      chartRef.current.genUntil=Math.max(chartRef.current.genUntil, t+1.0);
+      setWallUI(null);
+      setWallWarning(false);
+      wallRef.current.pending=false;
+    },1200);
+  },[showMsg,chartRef,playStartRef]);
+
+  const onWallTimeout=useCallback(()=>{
+    doDamage();
+    showMsg('💀 벽 파괴 실패!','#ef4444');
+    wallRef.current={state:'idle'};
+    wallHitCountRef.current=0;
+    const t=(performance.now()-playStartRef.current)/1000;
+    chartRef.current.genUntil=Math.max(chartRef.current.genUntil, t+1.0);
+    setWallUI(null);
+    setWallWarning(false);
+    wallRef.current.pending=false;
+  },[doDamage,showMsg,playStartRef,chartRef]);
+
+  // 점수 모니터링: 3000점마다 벽 이벤트 트리거
+  useEffect(()=>{
+    if(gs!==GS.PLAYING)return;
+    const milestone=Math.floor(score/3000)*3000;
+    if(milestone>0&&milestone>lastWallScoreRef.current
+       &&wallRef.current.state==='idle'&&!wallRef.current.pending){
+      lastWallScoreRef.current=milestone;
+      wallRef.current.pending=true;
+      // 경고 1초 전부터 노트 차단: genUntil을 현재시간+2초+2초 앞으로
+      const t=(performance.now()-playStartRef.current)/1000;
+      chartRef.current.genUntil=Math.max(chartRef.current.genUntil, t+3.5);
+      setWallWarning(true);
+      playWarningSiren();
+      setTimeout(()=>setWallWarning(false),1800);
+      setTimeout(()=>{
+        if(wallRef.current.state==='idle'){
+          wallRef.current={state:'stopped'};
+          wallHitCountRef.current=0;
+          setWallUI({hits:0,breaking:false});
+        }
+      },1900);
+    }
+  },[score,gs]);
 
   const onMultChange=useCallback(m=>{
     setMult(m);
@@ -1111,6 +1679,11 @@ function App(){
     chartRef.current=freshChart(m);
     playTimeRef.current=0;
     playStartRef.current=performance.now();
+    wallRef.current={state:'idle'};
+    wallHitCountRef.current=0;
+    lastWallScoreRef.current=0;
+    wallRef.current.pending=false;
+    setWallUI(null);setWallWarning(false);
     setPlaying(false); // 잠깐 unmount
     await new Promise(r=>setTimeout(r,30));
     setPlaying(true);  // 새 chartRef로 remount
@@ -1142,20 +1715,68 @@ function App(){
       <video ref={videoRef} style={{position:'absolute',opacity:0,pointerEvents:'none',width:640,height:480}} playsInline muted autoPlay/>
       {flash&&<div style={{position:'absolute',inset:0,background:'rgba(220,38,38,.48)',zIndex:60,pointerEvents:'none',animation:'dmgflash .32s ease-out forwards'}}/>}
 
-      <Canvas frameloop="always" dpr={[1,Math.min(window.devicePixelRatio??1,1.3)]}
-        gl={{antialias:false,powerPreference:'high-performance'}} shadows={false}>
+      <Canvas frameloop="always"
+        dpr={[1, Math.min(window.devicePixelRatio??1, window.innerWidth<600?1.0:1.5)]}
+        gl={{antialias:false,powerPreference:'high-performance',
+             stencil:false,depth:true,alpha:false}} shadows={false}>
         {gs===GS.PLAYING&&playing&&
           <GameScene gameStatus={gs} audioRef={audioRef}
             handDataRef={handDataRef} headPositionRef={headPositionRef}
             chartRef={chartRef} multRef={multRef}
             playStartRef={playStartRef}
             onNoteHit={onHit} onNoteMiss={onMiss} onObstacleHit={onObsHit}
-            onMultChange={onMultChange}/>
+            onMultChange={onMultChange}
+            wallRef={wallRef} onWallHit={onWallHit} onWallBreak={onWallBreak} onWallTimeout={onWallTimeout}/>
         }
       </Canvas>
 
       <WebcamPreview videoRef={videoRef} resultsRef={lastResultsRef} isCameraReady={isCameraReady}/>
+      {(gs===GS.IDLE||gs===GS.GAME_OVER)&&isCameraReady&&
+        <HandCursor handDataRef={handDataRef}/>}
       <ObsWarn type={obsW}/>
+      {/* 벽 WARNING — position:fixed로 진짜 화면 정중앙 */}
+      {gs===GS.PLAYING&&wallWarning&&(
+        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,
+          display:'flex',alignItems:'center',justifyContent:'center',
+          zIndex:45,pointerEvents:'none',textAlign:'center',
+          animation:'warnpulse .3s ease-in-out infinite'}}>
+          <div style={{fontSize:'clamp(44px,10vw,80px)',fontWeight:900,color:'#ff1100',
+            textShadow:'0 0 40px #ff2200, 0 0 80px #ff4400',letterSpacing:6,lineHeight:1}}>
+            ⚠️ WARNING!
+          </div>
+        </div>
+      )}
+      {/* 벽 공격 유도 멘트 — fixed + flex 중앙 */}
+      {gs===GS.PLAYING&&wallUI&&!wallUI.breaking&&!wallWarning&&(
+        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,
+          display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'flex-start',
+          paddingTop:'12%',
+          zIndex:40,pointerEvents:'none',textAlign:'center'}}>
+          <div style={{animation:'warnpulse .5s ease-in-out infinite'}}>
+            <div style={{fontSize:'clamp(18px,4vw,30px)',color:'#ffcc00',fontWeight:900,
+              textShadow:'0 0 20px #ffcc00',letterSpacing:2,whiteSpace:'nowrap'}}>
+              ⚔️ 빠르게 공격하세요!
+            </div>
+          </div>
+          <div style={{marginTop:10,background:'rgba(0,0,0,0.8)',borderRadius:10,
+            overflow:'hidden',height:14,border:'2px solid #f97316',width:240}}>
+            <div style={{height:'100%',background:'linear-gradient(90deg,#ef4444,#f97316)',
+              width:`${(wallUI.hits/WALL_HITS_NEEDED)*100}%`,transition:'width 0.08s'}}/>
+          </div>
+          <div style={{fontSize:'clamp(11px,2vw,15px)',color:'rgba(249,115,22,0.9)',
+            marginTop:5,fontWeight:700}}>{wallUI.hits} / {WALL_HITS_NEEDED}</div>
+        </div>
+      )}
+      {gs===GS.PLAYING&&wallUI?.breaking&&(
+        <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,
+          display:'flex',alignItems:'center',justifyContent:'center',
+          zIndex:40,pointerEvents:'none',animation:'msgpop 1.2s ease-out forwards'}}>
+          <div style={{fontSize:'clamp(32px,7vw,56px)',fontWeight:900,color:'#f97316',
+            textShadow:'0 0 40px #f97316, 0 0 80px #ff4400'}}>
+            💥 벽 파괴!
+          </div>
+        </div>
+      )}
 
       {hitMsg&&(
         <div style={{position:'absolute',top:'29%',left:'50%',zIndex:35,pointerEvents:'none',
@@ -1192,18 +1813,23 @@ function App(){
                 <div style={{fontWeight:900,marginTop:4,color:colors[tier],
                   ...fs(sizes[tier],minSizes[tier],tier>=2?32:22),
                   animation:animations[tier],
-                  position:'relative',left:'50%',transform:'translateX(-50%)',
+                  display:'block',width:'100%',
                   textShadow:tier>=2?`0 0 20px ${colors[tier]},0 0 40px ${colors[tier]}`:'none',
-                  whiteSpace:'nowrap',display:'inline-block'}}>
+                  whiteSpace:'nowrap'}}>
                   {labels[tier]}{combo}x COMBO{labels[tier]}
                 </div>
               );
             })()}
             {combo===0&&<div style={{fontWeight:700,marginTop:4,color:'#4b5563',...fs('3vw',12,19)}}>— COMBO —</div>}
-            <div style={{marginTop:5,background:'rgba(120,53,15,.84)',border:'2px solid #d97706',borderRadius:9,padding:'5px 11px',display:'inline-block'}}>
-              <div style={{color:'#fcd34d',fontWeight:700,letterSpacing:2,marginBottom:2,...fs('1.8vw',9,11)}}>지금 때릴 숫자</div>
-              <div style={{color:'#fef3c7',fontWeight:900,...fs('2.8vw',12,17)}}><span style={{color:'#fbbf24',...fs('3.8vw',17,25)}}>{mult}</span>의 배수</div>
-              <div style={{color:'rgba(251,191,36,.5)',marginTop:1,...fs('1.8vw',9,11)}}>예: {mult*2}, {mult*3}, {mult*5}…</div>
+            <div style={{marginTop:6,display:'inline-block',textAlign:'center'}}>
+              <div style={{color:'rgba(251,191,36,0.55)',fontWeight:600,letterSpacing:3,
+                textTransform:'uppercase',...fs('1.6vw',8,10),marginBottom:1}}>배수</div>
+              <div style={{lineHeight:1,display:'flex',alignItems:'baseline',justifyContent:'center',gap:'0.15em'}}>
+                <span style={{color:'#fbbf24',fontWeight:900,
+                  textShadow:'0 0 18px rgba(251,191,36,0.7)',
+                  ...fs('7vw',30,52)}}>{mult}</span>
+                <span style={{color:'rgba(251,191,36,0.7)',fontWeight:700,...fs('3vw',13,20)}}>의 배수</span>
+              </div>
             </div>
           </div>
           <div style={{color:'#9ca3af',background:'rgba(0,0,0,.52)',padding:'5px 9px',borderRadius:7,
@@ -1241,26 +1867,26 @@ function App(){
           <div style={{background:'rgba(255,255,255,.04)',borderRadius:10,padding:'12px 14px',
             border:'1px solid rgba(255,255,255,.09)',textAlign:'left',marginBottom:14,
             color:'#d1d5db',lineHeight:2,...fs('2.5vw',11,13)}}>
-            <div><span style={{color:'#ef4444',fontWeight:700}}>■ 빨강 판</span> = 왼손만 &nbsp;|&nbsp; <span style={{color:'#3b82f6',fontWeight:700}}>■ 파랑 판</span> = 오른손만</div>
-            <div>🟡 <b style={{color:'#f59e0b'}}>금테 판</b> = 배수 정답 → <b>양손 모두</b> 타격 가능!</div>
-            <div style={{color:'#a3a3a3',paddingLeft:12}}>
-              └ 정답+색일치 = <b style={{color:'#fbbf24'}}>3배 점수(콤보시)</b> &nbsp;|&nbsp; 정답만 = 기본 점수
-            </div>
-            <div style={{color:'#a3a3a3',paddingLeft:12}}>└ 오답+색일치 = ¼ 점수 &nbsp;|&nbsp; <b style={{color:'#ff4444'}}>오답+색불일치 = -150점 ❌</b></div>
-            <div>💖 <b style={{color:'#ec4899'}}>분홍 ♥</b> = 때리면 라이프 +1</div>
-            <div>⚠️ <b style={{color:'#f97316'}}>주황 장애물</b> = <b>머리로만</b> 회피! (손 무관)</div>
+            <div><span style={{color:'#ef4444',fontWeight:700}}>■ 빨강</span> = 왼쪽 광선검 &nbsp;|&nbsp; <span style={{color:'#3b82f6',fontWeight:700}}>■ 파랑</span> = 오른쪽 광선검</div>
+            <div>🎯 <b style={{color:'#fbbf24'}}>색 일치 + 정답 배수</b> = <b>+300점 (콤보↑)</b></div>
+            <div>✓ <b style={{color:'#f59e0b'}}>색 다름 + 정답 배수</b> = <b>+100점 (콤보↑)</b></div>
+            <div>△ <b>색만 일치 (오답)</b> = <b>+50점</b> (콤보 안 오름)</div>
+            <div style={{color:'#ff4444',fontWeight:700}}>❌ 색도 다르고 오답 = -50점 + 하트 감소</div>
+            <div>💖 <b style={{color:'#ec4899'}}>분홍 ♥</b> = 때리면 라이프 +1 (콤보↑)</div>
+            <div>⚠️ <b style={{color:'#f97316'}}>주황 장애물</b> = <b>머리로만</b> 회피!</div>
             <div style={{color:'#6b7280',marginTop:3,...fs('2vw',9,11)}}>
-              정답 놓침 / 장애물 충돌 = ❤️ -1 &nbsp;|&nbsp; 하트 0 = 게임 오버
+              모든 도형을 놓치면 = ❤️ -1 &nbsp;|&nbsp; 하트 0 = 게임 오버
             </div>
           </div>
           {!isCameraReady
             ?<div style={{color:'#f87171',background:'rgba(127,29,29,.3)',padding:10,borderRadius:7,...fs('2.5vw',11,13)}}>📷 카메라 준비 중…</div>
-            :<button onClick={startGame} style={{background:'#2563eb',color:'#fff',fontWeight:700,
-              padding:'13px 38px',borderRadius:999,border:'none',cursor:'pointer',
-              display:'flex',alignItems:'center',gap:8,margin:'0 auto',
-              boxShadow:'0 0 20px rgba(37,99,235,.55)',...fs('3.5vw',14,18)}}>
-              ▶ 게임 시작
-            </button>
+            :<div style={{margin:'0 auto',textAlign:'center'}}>
+              <HandButton label="게임 시작" icon="▶" onActivate={startGame}
+                handDataRef={handDataRef} color="#2563eb"/>
+              <div style={{color:'rgba(255,255,255,0.35)',marginTop:8,...fs('1.8vw',9,11)}}>
+                ✋ 손을 버튼 위에 올려도 시작돼요
+              </div>
+            </div>
           }
         </>)}
 
@@ -1273,11 +1899,10 @@ function App(){
           <p style={{color:'#6b7280',marginBottom:20,...fs('2.5vw',11,14)}}>
             ⏱ 생존 시간: {Math.floor((performance.now()-playStartRef.current)/1000)}초
           </p>
-          <button onClick={startGame} style={{background:'rgba(255,255,255,.1)',color:'#fff',
-            padding:'11px 26px',borderRadius:999,border:'1px solid rgba(255,255,255,.22)',
-            cursor:'pointer',display:'flex',alignItems:'center',gap:7,margin:'0 auto',...fs('3.5vw',13,17)}}>
-            🔄 다시 플레이
-          </button>
+          <div style={{margin:'0 auto',textAlign:'center'}}>
+            <HandButton label="다시 플레이" icon="🔄" onActivate={startGame}
+              handDataRef={handDataRef} color="#7c3aed"/>
+          </div>
         </>)}
       </div>
     </div>
