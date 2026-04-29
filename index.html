@@ -47,8 +47,13 @@ const GS={LOADING:'LOADING',IDLE:'IDLE',PLAYING:'PLAYING',GAME_OVER:'GAME_OVER'}
 const COL={left:'#ef4444',right:'#3b82f6',correct:'#f59e0b',heart:'#ec4899',obstacle:'#ff4400'};
 const SPAWN_Z=-30,PLAYER_Z=0,MISS_Z=6,NOTE_SPEED=8;
 const BPM=140,BEAT=60/BPM;
-const LANE_X=[-1.5,-0.5,0.5,1.5];
-const LAYER_Y=[0.7,1.5,2.3];
+const _isMobile=()=>window.innerWidth<window.innerHeight;
+const LANE_X_PC=[-1.5,-0.5,0.5,1.5];
+const LANE_X_MB=[-1.0,-0.34,0.34,1.0];
+const LAYER_Y_PC=[0.7,1.5,2.3];
+const LAYER_Y_MB=[0.5,1.3,2.1];
+const LANE_X=LANE_X_PC; // 런타임에 동적 사용
+const LAYER_Y=LAYER_Y_PC;
 const MULT_OPTS=[2,3,4,5,6,7,8,9,10];
 const MAX_HEARTS=3;
 const PW=0.82,PH=0.82,PD=0.13; // 판 크기
@@ -89,12 +94,11 @@ function WallParticle({dx,dy,color,speed,size,life}){
   );
 }
 
-function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWallTimeout}){
+function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWallTimeout,wallVisible,wallBreaking}){
   const grp=useRef();
   const shakeRef=useRef(0);
   const hitCoolRef=useRef(0);
-  const[broken,setBroken]=useState(false);
-  const[prog,setProg]=useState(0); // 0~1
+  // broken state 완전 제거 → wallBreaking prop만 사용
   const progRef=useRef(0);
   const hpRef=useRef(); // HP바 mesh ref
   const timerRef=useRef(0); // 경과 시간
@@ -120,31 +124,38 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
     color:i%3===0?'#555':i%3===1?'#3a3a3a':'#888',
   })),[]);
 
-  // 직전 state 추적 (idle→stopped 전환 감지)
-  const prevStateRef=useRef('idle');
+  // wallVisible prop으로 리셋 감지 (broken state 없음)
+  const prevWallVisible=useRef(false);
+  const prevResetProg=useRef(0);
 
   useFrame((_,dt)=>{
     if(!grp.current||!wallRef.current)return;
     const w=wallRef.current;
 
-    // idle→stopped 전환 감지 → 상태 리셋
-    if(prevStateRef.current==='idle'&&w.state==='stopped'){
-      timerRef.current=0;
+    // 벽 새로 시작 시 모든 상태 리셋 (resetProg 플래그로 감지)
+    const rp = w.resetProg??0;
+    if(rp !== prevResetProg.current){
+      prevResetProg.current=rp;
       progRef.current=0;
       shakeRef.current=0;
       hitCoolRef.current=0;
       sparks.current=[];
-      setBroken(false);
-      if(grp.current)grp.current.visible=true;
     }
-    prevStateRef.current=w.state;
+    if(!prevWallVisible.current&&wallVisible){
+      progRef.current=0;
+      shakeRef.current=0;
+      hitCoolRef.current=0;
+      sparks.current=[];
+    }
+    prevWallVisible.current=wallVisible;
 
-    if(w.state==='idle')return;
+    if(!wallVisible)return;
 
-    // 5초 타이머
+    // 5초 타이머: wallRef.startTime 기준 (매 벽마다 독립적으로 리셋됨)
     if(w.state==='stopped'){
-      timerRef.current+=dt;
-      if(timerRef.current>=WALL_TIME_LIMIT){
+      const startT = w.startTime ?? performance.now();
+      const elapsed=(performance.now()-startT)/1000;
+      if(elapsed>=WALL_TIME_LIMIT){
         w.state='idle';
         onWallTimeout?.();
         return;
@@ -167,22 +178,30 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
       hpRef.current.material.color.set(p<0.4?'#ef4444':p<0.7?'#f97316':'#22c55e');
     }
 
-    // 불꽃 파티클 업데이트
+    // 불꽃 파티클 업데이트 (풀 방식, 배열 재생성 없음)
     const now3=performance.now()/1000;
-    sparks.current=sparks.current.filter(s=>(now3-s.t)<s.life);
-    sparkMeshes.current.forEach((m,i)=>{
-      if(!m)return;
-      const s=sparks.current[i];
-      if(!s){m.visible=false;return;}
-      const dt2=now3-s.t, f=dt2/s.life;
+    const sArr=sparks.current;
+    const sMeshes=sparkMeshes.current;
+    let si=0;
+    for(let k=0;k<sArr.length;k++){
+      const s=sArr[k];
+      const dt2=now3-s.t;
+      if(dt2>=s.life) continue; // 만료
+      const m=sMeshes[si++];
+      if(!m||si>SPARK_POOL)break;
+      const f=dt2/s.life;
       m.visible=true;
-      m.position.set(s.x+s.dx*dt2, 1.5+s.y+s.dy*dt2-4*dt2*dt2, 0.2);
-      m.scale.setScalar(Math.max(0.01,0.08*(1-f*f)));
-      if(m.material)m.material.opacity=Math.max(0,1-f*f*2);
-    });
+      m.position.set(s.x+s.dx*dt2, 1.5+s.y+s.dy*dt2-5*dt2*dt2, 0.2);
+      m.scale.setScalar(Math.max(0.01,0.09*(1-f*f)));
+      if(m.material)m.material.opacity=Math.max(0,1-f*1.8);
+    }
+    // 남은 mesh 숨기기
+    for(let k=si;k<SPARK_POOL;k++){const m=sMeshes[k];if(m)m.visible=false;}
+    // 만료된 파티클 제거 (가끔만)
+    if(now3%0.5<dt) sparks.current=sArr.filter(s=>(now3-s.t)<s.life);
 
-    // 히트 판정
-    if(w.state==='stopped' && hitCoolRef.current<=0){
+    // 히트 판정 (breaking 중엔 판정 중단)
+    if(w.state==='stopped' && hitCoolRef.current<=0 && !wallBreaking){
       const hd=handDataRef.current;
       for(const hand of[hd.left,hd.right]){
         if(!hand)continue;
@@ -204,7 +223,6 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
           onWallHit(Math.round(progRef.current*WALL_HITS_NEEDED));
           if(progRef.current>=1){
             w.state='breaking';
-            setBroken(true);
             onWallBreak();
             return;
           }
@@ -215,11 +233,8 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
     if(hitCoolRef.current>0)hitCoolRef.current-=dt;
   });
 
-  // broken state 대신 wallRef.current.state로 직접 판단
-  if(!wallRef.current)return null;
-  const wstate=wallRef.current.state;
-  if(wstate==='idle')return null;
-  if(wstate==='breaking'||broken){
+  if(!wallVisible)return null;
+  if(wallBreaking){
     return(
       <group position={[0,1.5,WALL_SPAWN_Z]}>
         {debrisData.map((d,i)=><WallParticle key={i} {...d}/>)}
@@ -260,7 +275,7 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
       <mesh position={[0,1.9,0.15]} geometry={_wallHPBgGeo}>
         <meshBasicMaterial color='#111' toneMapped={false} transparent opacity={0.7}/>
       </mesh>
-      <pointLight color='#ff3300' intensity={4+shakeRef.current*3} distance={7} decay={2}/>
+      <pointLight color='#ff3300' intensity={5} distance={7} decay={2}/>
       {/* 불꽃 파티클 풀 */}
       {Array.from({length:SPARK_POOL},(_,i)=>(
         <mesh key={`sp${i}`} ref={el=>sparkMeshes.current[i]=el} visible={false}>
@@ -326,13 +341,21 @@ const mkNote=(type,li,ll,t,mult)=>({
   numVal:Math.random()<0.65?mulOf(mult):nonMulOf(mult),
   hit:false,missed:false,hitTime:undefined
 });
-const mkHeart=(t)=>({
-  id:`h${_noteId++}`,time:t,
-  // 하트는 모든 레인/레이어에 고르게 — 양손 어디서든 칠 수 있게
-  lineIndex:rnd([0,1,2,3]),lineLayer:rnd([0,1,2]),
-  type:rnd(['left','right']),noteType:'heart',numVal:0,
-  hit:false,missed:false,hitTime:undefined
-});
+const mkHeart=(t,existingNotes)=>{
+  // 같은 시간 근처(±0.3초) 노트들이 쓴 위치 제외하고 배치
+  const nearby=(existingNotes||[]).filter(n=>Math.abs(n.time-t)<0.3);
+  const usedSlots=new Set(nearby.map(n=>n.lineIndex+','+n.lineLayer));
+  const allSlots=[];
+  for(let li=0;li<4;li++)for(let ll=0;ll<3;ll++)allSlots.push([li,ll]);
+  const free=allSlots.filter(([li,ll])=>!usedSlots.has(li+','+ll));
+  const slot=free.length>0?rnd(free):rnd(allSlots); // 빈 슬롯 없으면 그냥 랜덤
+  return{
+    id:`h${_noteId++}`,time:t,
+    lineIndex:slot[0],lineLayer:slot[1],
+    type:rnd(['left','right']),noteType:'heart',numVal:0,
+    hit:false,missed:false,hitTime:undefined
+  };
+};
 
 // ── 베기 라인 패턴 생성기 ──
 // type: 'row'(가로줄), 'col'(세로줄), 'diag'(대각선)
@@ -368,7 +391,13 @@ function generateNotesInRange(fromT,toT,mult){
   // 장애물 시간 집합 (앞뒤 1.0초 버퍼)
   const OBS_BUF=1.0;
   const obsTimes=obs.map(o=>o.time);
-  const nearObs=(t)=>obsTimes.some(ot=>Math.abs(t-ot)<OBS_BUF);
+  // O(1) 체크: 0.25초 단위 버킷으로 빠르게
+  const obsSet=new Set(obsTimes.map(t=>Math.round(t*4)));
+  const nearObs=(t)=>{
+    const b=Math.round(t*4);
+    for(let k=b-4;k<=b+4;k++) if(obsSet.has(k)) return true;
+    return false;
+  };
 
   // ── 일반 패턴 ──
   const NORMAL_PATTERNS=[
@@ -433,7 +462,7 @@ function generateNotesInRange(fromT,toT,mult){
   // 하트
   let ht_=Math.ceil(fromT/heartGap)*heartGap;
   while(ht_<toT){
-    if(!nearObs(ht_))notes.push(mkHeart(ht_));
+    if(!nearObs(ht_))notes.push(mkHeart(ht_,notes));
     ht_+=heartGap;
   }
 
@@ -442,7 +471,12 @@ function generateNotesInRange(fromT,toT,mult){
 
 // reassignNums: numVal만 재배정 (배수 변경시 아직 안맞은 노트)
 function reassignNums(notes,mult){
-  notes.forEach(n=>{if(n.noteType==='note'&&!n.hit&&!n.missed)n.numVal=Math.random()<0.65?mulOf(mult):nonMulOf(mult);});
+  // filter 없이 직접 순회 (배열 재생성 방지)
+  for(let i=0;i<notes.length;i++){
+    const n=notes[i];
+    if(n.noteType==='note'&&!n.hit&&!n.missed)
+      n.numVal=Math.random()<0.65?mulOf(mult):nonMulOf(mult);
+  }
 }
 
 // 초기 채보 (첫 10초치 미리 생성, 4초 딜레이 후 시작)
@@ -491,7 +525,7 @@ function useMediaPipe(videoRef){
         const hl=await HandLandmarker.createFromOptions(vision,{
           baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},
           runningMode:'VIDEO',numHands:2,
-          minHandDetectionConfidence:0.25,minHandPresenceConfidence:0.25,minTrackingConfidence:0.25
+          minHandDetectionConfidence:0.7,minHandPresenceConfidence:0.5,minTrackingConfidence:0.5
         });
         if(!active){hl.close();return;}
         const fd=await FaceDetector.createFromOptions(vision,{
@@ -547,7 +581,11 @@ function useMediaPipe(videoRef){
                 const bh=bb.height/H;
                 // 미러보정: x 반전, y는 그대로 (0=상단, 1=하단)
                 headRef.current={x:1-cx,y:cy,h:bh,detected:true};
-              }else headRef.current={...headRef.current,detected:false};
+              }else{
+                // 얼굴 미감지 시 이전 좌표 유지하되 detected=false
+                // → 장애물 판정 시 미감지면 자동 통과 (페널티 없음)
+                headRef.current={...headRef.current,detected:false};
+              }
             }
           }catch(e){}
         }
@@ -561,33 +599,50 @@ function useMediaPipe(videoRef){
       const s=handDataRef.current;
       s.lastTs=now;
       const isMobile=window.innerWidth<window.innerHeight;
-      const xScale=isMobile?13.0:14.0;
-      const yScale=isMobile?8.5:8.0;
-      const yOff=isMobile?-1.2:-1.4;
+      const xScale=isMobile?9.0:14.0;   // 모바일: 좁은 화면에 맞게
+      const yScale=isMobile?6.5:8.0;    // 모바일: 높이 범위 축소
+      const yOff=isMobile?-0.8:-1.4;    // 모바일: 수직 중심 조정
 
       let gotL=false,gotR=false;
+      // 같은 side 중복 감지 시 신뢰도 높은 것만 채택 (좌우 꼬임 방지)
+      const bestBySide={left:null,right:null};
       if(hr.landmarks?.length>0){
         for(let i=0;i<hr.landmarks.length;i++){
           const lm=hr.landmarks[i];
           const isRight=hr.handedness[i][0].categoryName==='Left';
-          const cx=(lm[0].x+lm[5].x+lm[17].x)/3;
-          const cy=(lm[0].y+lm[5].y+lm[17].y)/3;
-          const tx=(0.5-cx)*xScale;
-          const ty=(1-cy)*yScale+yOff;
-          const wx0=(0.5-lm[0].x)*xScale, wy0=(1-lm[0].y)*yScale+yOff;
-          const wxM=(0.5-lm[9].x)*xScale, wyM=(1-lm[9].y)*yScale+yOff;
-          const tiltZ=(lm[9].z-lm[0].z)*22.0;
-          const rawDir=new THREE.Vector3(wxM-wx0,wyM-wy0,tiltZ).normalize();
           const side=isRight?'right':'left';
-          // raw 목표값 저장 (보간 안 함)
-          if(!s[side])s[side]={pos:new THREE.Vector3(tx,ty,0),dir:rawDir.clone(),vel:new THREE.Vector3(),targetPos:new THREE.Vector3(tx,ty,0),targetDir:rawDir.clone(),graceCount:0};
-          else{s[side].targetPos.set(tx,ty,0);s[side].targetDir.copy(rawDir);}
-          s[side].graceCount=0;
-          if(isRight)gotR=true;else gotL=true;
+          const score=hr.handedness[i][0].score??0;
+          // 이미 추적 중인 손이 있고 새 감지 신뢰도가 낮으면 무시 (사물 오인식 방지)
+          if(s[side]&&score<0.6)continue;
+          if(!bestBySide[side]||score>bestBySide[side].score)
+            bestBySide[side]={lm,score};
         }
       }
-      // grace 카운터 증가 (못 잡은 손)
-      const GRACE_MAX=50;
+      for(const side of['left','right']){
+        const best=bestBySide[side];
+        if(!best)continue;
+        const lm=best.lm;
+        const cx=(lm[0].x+lm[5].x+lm[17].x)/3;
+        const cy=(lm[0].y+lm[5].y+lm[17].y)/3;
+        const tx=(0.5-cx)*xScale;
+        const ty=(1-cy)*yScale+yOff;
+
+        // ── 칼날 방향: 손목(0) → 중지MCP(9) ──
+        // 롱소드를 쥔 자세: 손목=칼자루끝, 손목→중지MCP = 칼이 뻗는 방향
+        // 손을 세우면 중지MCP가 위 → 칼이 위, 휘두르면 그대로 추종
+        // x: 미러 반전(-), y: 위가 양수(-), z: 깊이
+        const sdx = -(lm[9].x - lm[0].x);
+        const sdy = -(lm[9].y - lm[0].y);
+        const sdz =  (lm[9].z - lm[0].z) * 2.5;
+        const rawDir=new THREE.Vector3(sdx, sdy, sdz).normalize();
+
+        if(!s[side])s[side]={pos:new THREE.Vector3(tx,ty,0),dir:rawDir.clone(),vel:new THREE.Vector3(),targetPos:new THREE.Vector3(tx,ty,0),targetDir:rawDir.clone(),graceCount:0};
+        else{s[side].targetPos.set(tx,ty,0);s[side].targetDir.copy(rawDir);}
+        s[side].graceCount=0;
+        if(side==='right')gotR=true;else gotL=true;
+      }
+      // grace: 천천히 휘둘러도 끊기지 않게 (30fps 기준 ~0.5초)
+      const GRACE_MAX=15;
       for(const side of['left','right']){
         if(side==='left'&&gotL)continue;
         if(side==='right'&&gotR)continue;
@@ -620,8 +675,9 @@ function Saber({type,handDataRef}){
   // 보간용 현재값 (useFrame에서 매 프레임 dt 기반으로 업데이트)
   const sPos=useRef(new THREE.Vector3(type==='left'?-2.0:2.0,0.8,0));
   const sQ=useRef(new THREE.Quaternion());
+  const _tQ=useRef(new THREE.Quaternion()); // targetQ 재사용
   const swingAcc=useRef(0),lastSwingT=useRef(0);
-  const hideTimer=useRef(0); // 손 없을 때 카운트다운
+  const hideTimer=useRef(1.2); // 처음부터 표시
   const idleT=useRef(0);
   const prevPos=useRef(new THREE.Vector3());
 
@@ -629,35 +685,41 @@ function Saber({type,handDataRef}){
     if(!grp.current)return;
     const data=type==='left'?handDataRef.current.left:handDataRef.current.right;
     if(data){
-      hideTimer.current=0.55; // 손 잡히면 타이머 리셋
+      hideTimer.current=1.2; // 손 잡히면 타이머 리셋 (빠른 스윙 대응)
       grp.current.visible=true;
 
       // ── 위치 보간: 지수 감쇠 (프레임레이트 독립적) ──
       // halfLife: 목표까지 절반 거리 도달 시간(초). 작을수록 빠름
-      const dist=sPos.current.distanceTo(data.targetPos);
-      // 거리 멀수록 halfLife 짧게 (더 빠르게 따라감)
-      const posHalfLife=Math.max(0.022, 0.065-dist*0.012);
+      const tp=data.targetPos??data.pos;
+      if(!tp)return;
+      const dist=sPos.current.distanceTo(tp);
+      const posHalfLife=Math.max(0.012, 0.038-dist*0.008);
       const posAlpha=1-Math.pow(0.5, dt/posHalfLife);
-      sPos.current.lerp(data.targetPos, posAlpha);
+      sPos.current.lerp(tp, posAlpha);
       grp.current.position.copy(sPos.current);
       // 히트 판정용 pos 동기화
       data.pos.copy(sPos.current);
 
-      // ── 방향 보간: 각도 거리 기반 halfLife ──
-      const targetQ=new THREE.Quaternion().setFromUnitVectors(_UP,data.targetDir);
+      // ── 방향 보간 ──
+      const td=data.targetDir??data.dir;
+      if(!td)return;
+      // setFromUnitVectors: (0,1,0) → td 방향으로 칼 회전
+      _tQ.current.setFromUnitVectors(_UP, td);
+      const targetQ=_tQ.current;
       const angleDiff=sQ.current.angleTo(targetQ);
-      const rotHalfLife=Math.max(0.018, 0.055-angleDiff*0.008);
+      const rotHalfLife=Math.max(0.018, 0.040-angleDiff*0.005);
       const rotAlpha=1-Math.pow(0.5, dt/rotHalfLife);
       sQ.current.slerp(targetQ, rotAlpha);
       grp.current.quaternion.copy(sQ.current);
-      // dir 동기화
       data.dir.set(0,1,0).applyQuaternion(sQ.current).normalize();
 
-      // ── 스윙 글로우 ──
-      const frameVel=new THREE.Vector3().subVectors(sPos.current,prevPos.current).divideScalar(Math.max(dt,0.001));
-      data.vel=frameVel;
+      // ── 스윙 속도 계산 ──
+      const fvx=sPos.current.x-prevPos.current.x, fvy=sPos.current.y-prevPos.current.y, fvz=sPos.current.z-prevPos.current.z;
+      const dtt=Math.max(dt,0.001);
+      if(!data.vel)data.vel=new THREE.Vector3();
+      data.vel.set(fvx/dtt,fvy/dtt,fvz/dtt);
       prevPos.current.copy(sPos.current);
-      const spd=frameVel.length();
+      const spd=data.vel.length();
       swingAcc.current=THREE.MathUtils.lerp(swingAcc.current,Math.min(spd*0.07,1),0.35);
       const glow=2.8+swingAcc.current*16;
       if(glowRef.current)glowRef.current.material.emissiveIntensity=glow;
@@ -1011,7 +1073,8 @@ function NoteComp({data,playStartRef,multRef}){
   const isCorrect=!isHeart&&data.numVal!==0&&data.numVal%mult===0;
   const noteColor=data.type==='left'?COL.left:COL.right;
   const edgeCol=noteColor; // 테두리는 항상 노트 색 (빨강/파랑만)
-  const nx=LANE_X[data.lineIndex], ny=LAYER_Y[data.lineLayer];
+  const mob=_isMobile();
+  const nx=(mob?LANE_X_MB:LANE_X_PC)[data.lineIndex], ny=(mob?LAYER_Y_MB:LAYER_Y_PC)[data.lineLayer];
   const hitTimeRef=useRef(null);
   const visRef=useRef(true);
 
@@ -1086,6 +1149,9 @@ function NoteComp({data,playStartRef,multRef}){
 const obsGeoH=new THREE.BoxGeometry(5.4,0.65,0.45);
 const obsGeoV=new THREE.BoxGeometry(0.65,4.2,0.45);
 const obsConeGeo=new THREE.ConeGeometry(0.38,0.65,3);
+// EdgesGeometry 캐싱 (ObsComp 렌더마다 생성 방지)
+const obsEdgesH=new THREE.EdgesGeometry(obsGeoH);
+const obsEdgesV=new THREE.EdgesGeometry(obsGeoV);
 
 function ObsComp({data,playStartRef}){
   const grpRef=useRef();
@@ -1107,7 +1173,7 @@ function ObsComp({data,playStartRef}){
   if(data.obstacleType==='top')return(
     <group ref={grpRef} position={[baseX,baseY,0]}>
       <mesh geometry={obsGeoH}><ObsMat/></mesh>
-      <lineSegments geometry={new THREE.EdgesGeometry(obsGeoH)}>
+      <lineSegments geometry={obsEdgesH}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
       </lineSegments>
       <mesh position={[0,-0.52,0.24]} rotation={[0,0,Math.PI]} geometry={obsConeGeo}><EdgeMat/></mesh>
@@ -1117,7 +1183,7 @@ function ObsComp({data,playStartRef}){
   if(data.obstacleType==='left')return(
     <group ref={grpRef} position={[baseX,baseY,0]}>
       <mesh geometry={obsGeoV}><ObsMat/></mesh>
-      <lineSegments geometry={new THREE.EdgesGeometry(obsGeoV)}>
+      <lineSegments geometry={obsEdgesV}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
       </lineSegments>
       <mesh position={[0.55,0,0.24]} rotation={[0,0,-Math.PI/2]} geometry={obsConeGeo}><EdgeMat/></mesh>
@@ -1127,7 +1193,7 @@ function ObsComp({data,playStartRef}){
   return(
     <group ref={grpRef} position={[baseX,baseY,0]}>
       <mesh geometry={obsGeoV}><ObsMat/></mesh>
-      <lineSegments geometry={new THREE.EdgesGeometry(obsGeoV)}>
+      <lineSegments geometry={obsEdgesV}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
       </lineSegments>
       <mesh position={[-0.55,0,0.24]} rotation={[0,0,Math.PI/2]} geometry={obsConeGeo}><EdgeMat/></mesh>
@@ -1177,13 +1243,28 @@ function WebcamPreview({videoRef,resultsRef,isCameraReady}){
   );
 }
 
+// ── 모듈 레벨 히트 판정 (useFrame 안 함수 생성 방지) ──
+const _POMMEL_OFF=-0.37, _TIP_OFF=2.49, _HIT_R=0.92;
+function bladeHit(hand, nx, ny){
+  if(!hand)return false;
+  const {pos,dir}=hand;
+  const bx0=pos.x+dir.x*_POMMEL_OFF, by0=pos.y+dir.y*_POMMEL_OFF;
+  const bx1=pos.x+dir.x*_TIP_OFF,   by1=pos.y+dir.y*_TIP_OFF;
+  const dxB=bx1-bx0, dyB=by1-by0;
+  const lenSq=dxB*dxB+dyB*dyB;
+  let t2=0;
+  if(lenSq>0.0001) t2=Math.max(0,Math.min(1,((nx-bx0)*dxB+(ny-by0)*dyB)/lenSq));
+  const cx2=bx0+t2*dxB, cy2=by0+t2*dyB;
+  return Math.sqrt((cx2-nx)**2+(cy2-ny)**2)<_HIT_R;
+}
+
 // ══════════════════════════════════════
 // GameScene
 // ══════════════════════════════════════
 function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
                     chartRef,multRef,playStartRef,
                     onNoteHit,onNoteMiss,onObstacleHit,onMultChange,
-                    onWallStart,onWallHit,onWallBreak,onWallTimeout,wallRef}){
+                    onWallStart,onWallHit,onWallBreak,onWallTimeout,wallRef,wallVisible,wallBreaking,resetKey}){
   const[tick,setTick]=useState(0);
   const bump=useCallback(()=>setTick(t=>t+1),[]);
   const ctRef=useRef(0); // 실시간 게임시간 ref — state 지연 없음
@@ -1192,11 +1273,12 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
   const lmcRef=useRef(0),obsCool=useRef(0),ctTs=useRef(0);
   const lastWallScoreRef=useRef(0); // 마지막 벽 이벤트 점수 기준
 
-  // 게임 리셋
+  // 게임 리셋: PLAYING 전환 시마다 내부 상태 초기화
   useEffect(()=>{
+    if(gameStatus!==GS.PLAYING)return;
     ctRef.current=0;
     lmcRef.current=0;obsCool.current=0;setCtDisplay(0);bump();
-  },[]);
+  },[gameStatus]);
 
   useFrame((_,dt)=>{
     if(gameStatus===GS.PLAYING){
@@ -1214,19 +1296,22 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
     const time=(performance.now()-playStartRef.current)/1000;
     ctRef.current=time; // 매 프레임 즉시 갱신
     const now=performance.now();
-    if(now-ctTs.current>33){ctTs.current=now;setCtDisplay(time);} // 렌더용은 33ms마다(~30fps)
+    if(now-ctTs.current>100){ctTs.current=now;setCtDisplay(time);} // 렌더용은 100ms마다(~10fps)
 
     // ── 무한 노트 스트리밍 (벽 이벤트 중엔 중단) ──
-    const wallActive=wallRef?.current?.pending||wallRef?.current?.state==='approaching'||wallRef?.current?.state==='stopped';
-    const STREAM_AHEAD=12;
+    const wallActive=wallRef?.current?.pending
+      ||wallRef?.current?.state==='approaching'
+      ||wallRef?.current?.state==='stopped'
+      ||wallRef?.current?.state==='breaking';
+    const STREAM_AHEAD=8; // 8초치만 미리 생성 (12→8: GC 스파이크 감소)
+    const STREAM_CHUNK=3; // 한 번에 3초치씩만 추가 (대량 생성 방지)
     if(!wallActive && time+STREAM_AHEAD>chartRef.current.genUntil){
       const fromT=chartRef.current.genUntil;
-      const toT=fromT+STREAM_AHEAD+4;
+      const toT=fromT+STREAM_CHUNK; // 3초치씩만
       const newData=generateNotesInRange(fromT,toT,multRef.current);
-      chartRef.current.notes.push(...newData.notes);
-      chartRef.current.obstacles.push(...newData.obstacles);
+      for(let i=0;i<newData.notes.length;i++) chartRef.current.notes.push(newData.notes[i]);
+      for(let i=0;i<newData.obstacles.length;i++) chartRef.current.obstacles.push(newData.obstacles[i]);
       chartRef.current.genUntil=toT;
-      bump();
     }
 
     // ── 배수 변경 ──
@@ -1238,13 +1323,19 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       while(newMult===multRef.current&&MULT_OPTS.length>1);
       multRef.current=newMult;
       const ahead=Math.abs(SPAWN_Z-PLAYER_Z)/NOTE_SPEED;
-      reassignNums(chartRef.current.notes.filter(n=>n.time>time+ahead*0.5),newMult);
+      // filter 없이 직접 reassign (ahead 이후 노트만)
+      const aheadT=time+ahead*0.5;
+      for(let i=0;i<chartRef.current.notes.length;i++){
+        const n=chartRef.current.notes[i];
+        if(n.time>aheadT&&n.noteType==='note'&&!n.hit&&!n.missed)
+          n.numVal=Math.random()<0.65?mulOf(newMult):nonMulOf(newMult);
+      }
       onMultChange(newMult);
       bump();
     }
 
     // ── 메모리 정리: 완전히 지나간(hit or missed) 오래된 노트 제거 ──
-    if(Math.floor(time*0.2)!==Math.floor((time-dt)*0.2)){
+    if(Math.floor(time*0.1)!==Math.floor((time-dt)*0.1)){ // 10초마다 정리
       const cutoff=time-12;
       chartRef.current.notes=chartRef.current.notes.filter(n=>n.time>cutoff);
       chartRef.current.obstacles=chartRef.current.obstacles.filter(o=>o.time>cutoff);
@@ -1255,26 +1346,8 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
     const head=headPositionRef.current;
     const mult=multRef.current;
 
-    // ── 광선검 히트 판정 ──
-    // XY만 체크 (Z는 판정창으로 별도 처리) — 블레이드 선분과 노트 XY 거리
-    const POMMEL_OFF=-0.37;
-    const TIP_OFF=2.49;
-    const HIT_R=0.92;    // XY 히트 반경 (조금 넉넉하게)
-    const HIT_WIN=3.5;   // 판정창 Z 범위 (플레이어 앞뒤)
-
-    function bladeHit(hand, nx, ny){
-      if(!hand)return false;
-      const {pos,dir}=hand;
-      // 블레이드를 XY 평면 선분으로 투영해서 거리 계산
-      const bx0=pos.x+dir.x*POMMEL_OFF, by0=pos.y+dir.y*POMMEL_OFF;
-      const bx1=pos.x+dir.x*TIP_OFF,   by1=pos.y+dir.y*TIP_OFF;
-      const dxB=bx1-bx0, dyB=by1-by0;
-      const lenSq=dxB*dxB+dyB*dyB;
-      let t2=0;
-      if(lenSq>0.0001) t2=Math.max(0,Math.min(1,((nx-bx0)*dxB+(ny-by0)*dyB)/lenSq));
-      const cx2=bx0+t2*dxB, cy2=by0+t2*dyB;
-      return Math.sqrt((cx2-nx)**2+(cy2-ny)**2)<HIT_R;
-    }
+    // ── 광선검 히트 판정 (함수는 모듈 레벨에 정의됨) ──
+    const HIT_WIN=3.5;
 
     let anyChange=false;
     const notes=chartRef.current.notes;
@@ -1286,7 +1359,8 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       if(cz>MISS_Z){n.missed=true;onNoteMiss(n);anyChange=true;continue;}
       // 판정창 안에 있을 때만 히트 체크
       if(cz>PLAYER_Z-HIT_WIN&&cz<PLAYER_Z+HIT_WIN){
-        const nx=LANE_X[n.lineIndex],ny=LAYER_Y[n.lineLayer];
+        const mobO=_isMobile();
+        const nx=(mobO?LANE_X_MB:LANE_X_PC)[n.lineIndex],ny=(mobO?LAYER_Y_MB:LAYER_Y_PC)[n.lineLayer];
         const isCorrect=n.noteType==='heart'||(n.numVal!==0&&n.numVal%mult===0);
         let hitHand=null,hitVel=null;
         for(const[hand,side]of[[lHand,'left'],[rHand,'right']]){
@@ -1323,11 +1397,14 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
           // top 장애물: 머리 안 숙이면(y가 작으면=화면 위쪽) 맞음
           // left 장애물: 머리 오른쪽으로 안 피하면(x가 작으면=왼쪽에 있으면) 맞음
           // right 장애물: 머리 왼쪽으로 안 피하면(x가 크면=오른쪽에 있으면) 맞음
-          const topThresh=isMob?0.52:0.50;   // y > 이 값이면 숙인 것
-          const sideThresh=isMob?0.42:0.40;  // left장애물: x > (1-sideThresh) 피한 것
-          const hit=o.obstacleType==='top'  ? head.y<topThresh   // 안 숙임
-                   :o.obstacleType==='left' ? head.x<(1-sideThresh) // 오른쪽으로 안 피함
-                   :                          head.x>(sideThresh);   // 왼쪽으로 안 피함
+          // MediaPipe y: 0=위, 1=아래. 머리 숙이면 y가 커짐
+          // top 장애물: head.y < topThresh → 아직 안 숙임 → 맞음
+          //             head.y >= topThresh → 숙인 것 → 피함
+          const topThresh=isMob?0.52:0.50;   // y < 이 값이면 안 숙임 = 맞음
+          const sideThresh=isMob?0.42:0.40;
+          const hit=o.obstacleType==='top'  ? head.y<topThresh
+                   :o.obstacleType==='left' ? head.x<(1-sideThresh)
+                   :                          head.x>(sideThresh);
           if(hit){o.hit=true;obsCool.current=2.5;shk.current=0.85;onObstacleHit();}
           // 피한 경우: hit 처리 안 함 → 장애물이 그냥 지나쳐 사라짐
         }
@@ -1337,36 +1414,46 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
 
   const visNotes=useMemo(()=>{
     const ct=ctRef.current;
-    const wallOn=wallRef?.current?.state==='stopped'||wallRef?.current?.state==='approaching'||wallRef?.current?.state==='breaking';
-    if(wallOn)return[]; // 벽 이벤트 중 노트 완전 숨김
+    const wallOn=wallRef?.current?.pending||wallRef?.current?.state==='stopped'||wallRef?.current?.state==='approaching'||wallRef?.current?.state==='breaking';
+    if(wallOn)return[];
     return chartRef.current.notes.filter(n=>!n.missed&&(!n.hit||(ct-(n.hitTime??0))<1.2)&&n.time-ct<5.5&&n.time-ct>-3);
   },[tick,ctDisplay]);
   const visObs=useMemo(()=>{
     const ct=ctRef.current;
-    const wallOn=wallRef?.current?.state==='stopped'||wallRef?.current?.state==='approaching'||wallRef?.current?.state==='breaking';
+    const wallOn=wallRef?.current?.pending||wallRef?.current?.state==='stopped'||wallRef?.current?.state==='approaching'||wallRef?.current?.state==='breaking';
     if(wallOn)return[];
     return chartRef.current.obstacles.filter(o=>!o.hit&&o.time-ct<5.5&&o.time-ct>-2.5);
   },[tick,ctDisplay]);
 
+  const isPlaying=gameStatus===GS.PLAYING;
+  const isActive=isPlaying||(gameStatus&&gameStatus!=='LOADING');
   return(
     <>
-      <PerspectiveCamera ref={camRef} makeDefault position={[0,1.8,4]} fov={65}/>
-      <color attach="background" args={['#05050a']}/>
-      <fog   attach="fog"        args={['#05050a',14,50]}/>
-      <ambientLight ref={ambRef} intensity={0.12}/>
-      <spotLight ref={spotRef} position={[0,8,4]} angle={0.65} penumbra={1} intensity={0.62} castShadow={false}/>
-      <Grid position={[0,0,0]} args={[6,80]} cellThickness={0.07} cellColor="#14142a"
-        sectionSize={4} sectionThickness={1.1} sectionColor="#18307a" fadeDistance={46} infiniteGrid/>
-      <mesh rotation={[-Math.PI/2,0,0]} position={[0,-0.01,0]}>
-        <planeGeometry args={[4,80]}/><meshStandardMaterial color="#07070d" roughness={1} metalness={0}/>
-      </mesh>
-      <Stars radius={40} depth={40} count={350} factor={3} saturation={0} fade speed={0.4}/>
-      <Saber type="left"  handDataRef={handDataRef}/>
-      <Saber type="right" handDataRef={handDataRef}/>
-      {visNotes.map(n=><NoteComp key={n.id} data={n} playStartRef={playStartRef} multRef={multRef}/>)}
-      {visObs.map(o=><ObsComp key={o.id} data={o} playStartRef={playStartRef}/>)}
-      {wallRef&&<WallComp wallRef={wallRef} playStartRef={playStartRef}
-        handDataRef={handDataRef} onWallHit={onWallHit} onWallBreak={onWallBreak} onWallTimeout={onWallTimeout}/>}
+      <PerspectiveCamera ref={camRef} makeDefault
+        position={[0, _isMobile()?1.5:1.8, _isMobile()?3.2:4]}
+        fov={_isMobile()?78:65}/>
+      {/* 배경/조명/별 - IDLE부터 미리 렌더해서 게임시작 깜박임 방지 */}
+      {isActive&&<>
+        <fog   attach="fog"        args={['#05050a',14,50]}/>
+        <ambientLight ref={ambRef} intensity={0.12}/>
+        <spotLight ref={spotRef} position={[0,8,4]} angle={0.65} penumbra={1} intensity={0.62} castShadow={false}/>
+        <Grid position={[0,0,0]} args={[6,80]} cellThickness={0.07} cellColor="#14142a"
+          sectionSize={4} sectionThickness={1.1} sectionColor="#18307a" fadeDistance={46} infiniteGrid/>
+        <mesh rotation={[-Math.PI/2,0,0]} position={[0,-0.01,0]}>
+          <planeGeometry args={[4,80]}/><meshStandardMaterial color="#07070d" roughness={1} metalness={0}/>
+        </mesh>
+        <Stars radius={40} depth={40} count={350} factor={3} saturation={0} fade speed={0.4}/>
+      </>}
+      {/* 게임 오브젝트 - PLAYING일 때만 */}
+      {isPlaying&&<>
+        <Saber type="left"  handDataRef={handDataRef}/>
+        <Saber type="right" handDataRef={handDataRef}/>
+        {visNotes.map(n=><NoteComp key={n.id} data={n} playStartRef={playStartRef} multRef={multRef}/>)}
+        {visObs.map(o=><ObsComp key={o.id} data={o} playStartRef={playStartRef}/>)}
+        {wallRef&&<WallComp wallRef={wallRef} playStartRef={playStartRef}
+          handDataRef={handDataRef} onWallHit={onWallHit} onWallBreak={onWallBreak} onWallTimeout={onWallTimeout}
+          wallVisible={wallVisible} wallBreaking={wallBreaking}/>}
+      </>}
     </>
   );
 }
@@ -1374,7 +1461,27 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
 // ══════════════════════════════════════
 // UI
 // ══════════════════════════════════════
-function Hearts({count}){return(<div style={{display:'flex',gap:4}}>{Array.from({length:MAX_HEARTS}).map((_,i)=>(<svg key={i} viewBox="0 0 24 24" fill={i<count?'#ec4899':'#4b5563'} style={{width:'clamp(24px,5vw,34px)',height:'clamp(24px,5vw,34px)',transition:'all .2s',opacity:i<count?1:.2,transform:i<count?'scale(1.1)':'scale(0.9)',filter:i<count?'drop-shadow(0 0 6px #ec4899)':'none'}}><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>))}</div>);}
+function HeartIcon({filled}){
+  const sz='clamp(24px,5vw,34px)';
+  return(
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"
+      style={{width:sz,height:sz,display:'block',flexShrink:0,
+        opacity:filled?1:0.2,
+        transform:filled?'scale(1.1)':'scale(0.9)',
+        filter:filled?'drop-shadow(0 0 6px #ec4899)':'none',
+        transition:'all .2s'}}>
+      <path fill={filled?'#ec4899':'#4b5563'}
+        d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+    </svg>
+  );
+}
+function Hearts({count}){
+  const icons=[];
+  for(let i=0;i<MAX_HEARTS;i++){
+    icons.push(<HeartIcon key={i} filled={i<count}/>);
+  }
+  return(<div style={{display:'flex',gap:4,alignItems:'center'}}>{icons}</div>);
+}
 
 function ObsWarn({type}){
   if(!type)return null;
@@ -1387,24 +1494,22 @@ function ObsWarn({type}){
 // HandButton — 손을 올려 1초 유지하면 버튼 실행
 // ══════════════════════════════════════
 function HandButton({label,onActivate,handDataRef,color='#2563eb',icon='▶'}){
-  const [hoverPct,setHoverPct]=useState(0);
   const btnRef=useRef();
+  const circleRef=useRef();
   const timerRef=useRef(0);
-  const activeRef=useRef(false);
   const firedRef=useRef(false);
 
   useEffect(()=>{
     firedRef.current=false;
     timerRef.current=0;
-    setHoverPct(0);
   },[label]);
 
   useEffect(()=>{
     if(!handDataRef)return;
     let raf;
-    const HOLD_TIME=1.0; // 1초 유지
+    const HOLD_TIME=1.0;
     let lastT=performance.now();
-    function tick(){
+    const tick=()=>{
       raf=requestAnimationFrame(tick);
       if(firedRef.current)return;
       const btn=btnRef.current;
@@ -1415,69 +1520,57 @@ function HandButton({label,onActivate,handDataRef,color='#2563eb',icon='▶'}){
       const rect=btn.getBoundingClientRect();
       const hd=handDataRef.current;
       const isMobile=window.innerWidth<window.innerHeight;
-      const xScale=isMobile?13.0:14.0;
-      const yScale=isMobile?8.5:8.0;
-      const yOff=isMobile?-1.2:-1.4;
+      const xScale=isMobile?13.0:14.0, yScale=isMobile?8.5:8.0, yOff=isMobile?-1.2:-1.4;
       const W=window.innerWidth, H=window.innerHeight;
-      // 버튼 영역을 넉넉하게 확장 (손 커서 크기 고려)
-      const PAD=40;
+      const PAD=44;
       let hovering=false;
       for(const side of['left','right']){
         const hand=hd[side];
         if(!hand)continue;
         const tp=hand.targetPos??hand.pos;
         if(!tp)continue;
-        const normX=0.5-tp.x/xScale;
-        const normY=1-(tp.y-yOff)/yScale;
-        const screenX=normX*W;
-        const screenY=normY*H;
-        if(screenX>=rect.left-PAD&&screenX<=rect.right+PAD&&
-           screenY>=rect.top-PAD&&screenY<=rect.bottom+PAD){
-          hovering=true;break;
-        }
+        const sx=(0.5+tp.x/xScale)*W, sy=(1-(tp.y-yOff)/yScale)*H; // 미러 보정
+        if(sx>=rect.left-PAD&&sx<=rect.right+PAD&&sy>=rect.top-PAD&&sy<=rect.bottom+PAD){hovering=true;break;}
       }
       if(hovering){
-        timerRef.current=Math.min(HOLD_TIME, timerRef.current+dt);
-        setHoverPct(timerRef.current/HOLD_TIME);
-        if(timerRef.current>=HOLD_TIME&&!firedRef.current){
-          firedRef.current=true;
-          onActivate();
-        }
-      } else {
-        timerRef.current=Math.max(0, timerRef.current-dt*1.8);
-        setHoverPct(timerRef.current/HOLD_TIME);
+        timerRef.current=Math.min(HOLD_TIME,timerRef.current+dt);
+        if(timerRef.current>=HOLD_TIME&&!firedRef.current){firedRef.current=true;onActivate();return;}
+      }else{
+        timerRef.current=Math.max(0,timerRef.current-dt*2);
       }
-    }
+      // DOM 직접 업데이트 (setState 없음)
+      const pct=timerRef.current/HOLD_TIME;
+      if(circleRef.current){
+        const dash=pct*289;
+        circleRef.current.setAttribute('stroke-dasharray',`${dash} 289`);
+        circleRef.current.parentElement.style.opacity=pct>0.02?'1':'0';
+      }
+      if(btn){
+        const active=pct>0.02;
+        btn.style.background=active?color:'rgba(255,255,255,.1)';
+        btn.style.boxShadow=active?`0 0 24px ${color}`:'none';
+        btn.style.transform=active?'scale(1.05)':'scale(1)';
+        btn.style.border=active?'none':'1px solid rgba(255,255,255,.22)';
+      }
+    };
     raf=requestAnimationFrame(tick);
     return()=>cancelAnimationFrame(raf);
-  },[handDataRef,onActivate]);
+  },[handDataRef,onActivate,color]);
 
-  const pct=Math.round(hoverPct*100);
-  const isHovering=hoverPct>0.02;
   return(
-    <div ref={btnRef} style={{position:'relative',display:'inline-flex',alignItems:'center',
-      justifyContent:'center',cursor:'pointer',userSelect:'none'}}
+    <div style={{position:'relative',display:'inline-flex',alignItems:'center',justifyContent:'center'}}
       onClick={onActivate}>
-      {/* 원형 진행 링 */}
-      {isHovering&&(
-        <svg style={{position:'absolute',top:-8,left:-8,right:-8,bottom:-8,
-          width:'calc(100% + 16px)',height:'calc(100% + 16px)',pointerEvents:'none'}}
-          viewBox="0 0 100 100">
-          <circle cx="50" cy="50" r="46" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="5"/>
-          <circle cx="50" cy="50" r="46" fill="none" stroke={color} strokeWidth="5"
-            strokeLinecap="round"
-            strokeDasharray={`${pct*2.89} 289`}
-            transform="rotate(-90 50 50)"
-            style={{transition:'stroke-dasharray 0.05s'}}/>
-        </svg>
-      )}
-      <button style={{background:isHovering?color:'rgba(255,255,255,.1)',
-        color:'#fff',fontWeight:700,
-        padding:'13px 38px',borderRadius:999,border:isHovering?'none':'1px solid rgba(255,255,255,.22)',
+      <svg style={{position:'absolute',top:-8,left:-8,right:-8,bottom:-8,
+        width:'calc(100% + 16px)',height:'calc(100% + 16px)',pointerEvents:'none',opacity:0}}
+        viewBox="0 0 100 100">
+        <circle cx="50" cy="50" r="46" fill="none" stroke="rgba(255,255,255,0.15)" strokeWidth="5"/>
+        <circle ref={circleRef} cx="50" cy="50" r="46" fill="none" stroke={color} strokeWidth="5"
+          strokeLinecap="round" strokeDasharray="0 289" transform="rotate(-90 50 50)"/>
+      </svg>
+      <button ref={btnRef} style={{background:'rgba(255,255,255,.1)',color:'#fff',fontWeight:700,
+        padding:'13px 38px',borderRadius:999,border:'1px solid rgba(255,255,255,.22)',
         cursor:'pointer',display:'flex',alignItems:'center',gap:8,
-        boxShadow:isHovering?`0 0 28px ${color}`:'none',
-        transform:isHovering?'scale(1.06)':'scale(1)',
-        transition:'all 0.15s',fontSize:'clamp(14px,3.5vw,18px)'}}>
+        transition:'transform 0.1s',fontSize:'clamp(14px,3.5vw,18px)'}}>
         {icon} {label}
       </button>
     </div>
@@ -1485,49 +1578,51 @@ function HandButton({label,onActivate,handDataRef,color='#2563eb',icon='▶'}){
 }
 
 // ══════════════════════════════════════
-// HandCursor — 게임 밖 화면에서 손 위치 표시
+// HandCursor — DOM 직접 조작으로 setState 없이 60fps 렌더
 // ══════════════════════════════════════
 function HandCursor({handDataRef}){
-  const [positions,setPositions]=useState([]);
+  const dotRefs=[useRef(),useRef()];
+  const containerRef=useRef();
   useEffect(()=>{
     const isMobile=window.innerWidth<window.innerHeight;
     const xScale=isMobile?13.0:14.0;
     const yScale=isMobile?8.5:8.0;
     const yOff=isMobile?-1.2:-1.4;
+    const sides=['left','right'];
+    const colors=['rgba(239,68,68,0.85)','rgba(59,130,246,0.85)'];
+    const glows=['#ef4444','#3b82f6'];
     let raf;
     const tick=()=>{
       raf=requestAnimationFrame(tick);
       const W=window.innerWidth,H=window.innerHeight;
       const hd=handDataRef.current;
-      const pts=[];
-      for(const side of['left','right']){
+      sides.forEach((side,i)=>{
+        const el=dotRefs[i].current;
+        if(!el)return;
         const hand=hd[side];
-        if(!hand)continue;
+        if(!hand){el.style.display='none';return;}
         const tp=hand.targetPos??hand.pos;
-        if(!tp)continue;
-        const normX=0.5-tp.x/xScale;
-        const normY=1-(tp.y-yOff)/yScale;
-        const sx=normX*W, sy=normY*H;
-        if(sx>-50&&sx<W+50&&sy>-50&&sy<H+50)
-          pts.push({x:sx,y:sy,side});
-      }
-      setPositions(pts);
+        if(!tp){el.style.display='none';return;}
+        const sx=(0.5+tp.x/xScale)*W; // 미러 카메라 보정
+        const sy=(1-(tp.y-yOff)/yScale)*H;
+        el.style.display='block';
+        el.style.left=(sx-16)+'px';
+        el.style.top=(sy-16)+'px';
+      });
     };
     raf=requestAnimationFrame(tick);
     return()=>cancelAnimationFrame(raf);
   },[handDataRef]);
-  if(!positions.length)return null;
   return(
-    <div style={{position:'fixed',inset:0,pointerEvents:'none',zIndex:55}}>
-      {positions.map((p,i)=>(
-        <div key={i} style={{position:'absolute',
-          left:p.x-14,top:p.y-14,width:28,height:28,
-          borderRadius:'50%',
-          background:p.side==='left'?'rgba(239,68,68,0.7)':'rgba(59,130,246,0.7)',
-          border:'2.5px solid #fff',
-          boxShadow:`0 0 12px ${p.side==='left'?'#ef4444':'#3b82f6'}`,
-          transform:'translate(0,0)',
-          transition:'left 0.04s,top 0.04s',
+    <div ref={containerRef} style={{position:'fixed',inset:0,pointerEvents:'none',zIndex:55}}>
+      {['left','right'].map((side,i)=>(
+        <div key={side} ref={dotRefs[i]} style={{
+          position:'absolute',display:'none',
+          width:32,height:32,borderRadius:'50%',
+          background:side==='left'?'rgba(239,68,68,0.85)':'rgba(59,130,246,0.85)',
+          border:'2.5px solid rgba(255,255,255,0.9)',
+          boxShadow:`0 0 14px ${side==='left'?'#ef4444':'#3b82f6'}`,
+          pointerEvents:'none',
         }}/>
       ))}
     </div>
@@ -1546,7 +1641,7 @@ function App(){
   const[obsW,setObsW]=useState(null);
   const[flash,setFlash]=useState(false);
   const[hitMsg,setHitMsg]=useState(null);
-  const[playing,setPlaying]=useState(false); // GameScene mount 여부
+  const[gameKey,setGameKey]=useState(0); // 게임 시작마다 증가 → GameScene 강제 리마운트
 
   const audioRef=useRef(null);
   if(audioRef.current===null){const a=new Audio(SONG_URL);a.loop=true;audioRef.current=a;}
@@ -1560,6 +1655,8 @@ function App(){
   const wallRef=useRef({state:'idle',z:WALL_SPAWN_Z}); // state: idle/approaching/stopped/breaking
   const[wallUI,setWallUI]=useState(null); // null | {hits, breaking}
   const[wallWarning,setWallWarning]=useState(false);
+  const[wallVisible,setWallVisible]=useState(false);
+  const[wallBreaking,setWallBreaking]=useState(false);
   const wallHitCountRef=useRef(0);
   const lastWallScoreRef=useRef(0);
 
@@ -1604,39 +1701,51 @@ function App(){
   const onObsHit=useCallback(()=>{setCombo(0);showMsg('💥 장애물 충돌!','#ff6600');doDamage();},[doDamage,showMsg]);
 
   // 벽 이벤트 콜백
+  const wallUIThrottle=useRef(0);
   const onWallHit=useCallback((count)=>{
     playHit(true);
-    setWallUI({hits:count,breaking:false});
+    const now=performance.now();
+    if(now-wallUIThrottle.current>120){
+      wallUIThrottle.current=now;
+      setWallUI({hits:count,breaking:false});
+    }
   },[]);
 
   const onWallBreak=useCallback(()=>{
-    for(let i=0;i<WALL_HITS_NEEDED;i++){setCombo(c=>c+1);}
-    setScore(s=>s+2000);
-    showMsg('💥 벽 파괴! +2000','#f97316');
+    showMsg('💥 벽 파괴!','#f97316');
     playWallBreak();
+    wallRef.current.state='breaking'; // 즉시 히트판정/타이머 중단
     setWallUI({hits:WALL_HITS_NEEDED,breaking:true});
+    setWallBreaking(true);
     setTimeout(()=>{
-      wallRef.current={state:'idle'};
-      wallHitCountRef.current=0;
-      // 1초 뒤 노트 재개
       const t=(performance.now()-playStartRef.current)/1000;
-      chartRef.current.genUntil=Math.max(chartRef.current.genUntil, t+1.0);
-      setWallUI(null);
-      setWallWarning(false);
-      wallRef.current.pending=false;
-    },1200);
+      const TRAVEL=Math.abs(SPAWN_Z-PLAYER_Z)/NOTE_SPEED;
+      const resumeT=t+TRAVEL+0.5; // 파괴 후 TRAVEL+1.5초 뒤부터 노트 생성
+      // ① genUntil 먼저 설정 (state='idle' 전에 해야 스트리밍이 즉시 재개 안 됨)
+      chartRef.current.genUntil=Math.max(chartRef.current.genUntil, resumeT);
+      // ② 가까운 노트/장애물 제거
+      chartRef.current.notes=chartRef.current.notes.filter(n=>n.hit||n.missed||n.time>t+TRAVEL);
+      chartRef.current.obstacles=chartRef.current.obstacles.filter(o=>o.hit||o.time>t+TRAVEL);
+      // ③ UI 해제
+      setWallUI(null);setWallWarning(false);setWallVisible(false);setWallBreaking(false);
+      // ④ 마지막에 state='idle' (이 시점부터 스트리밍 재개 가능)
+      wallHitCountRef.current=0;
+      wallRef.current={state:'idle',pending:false};
+    },1500);
   },[showMsg,chartRef,playStartRef]);
 
   const onWallTimeout=useCallback(()=>{
     doDamage();
     showMsg('💀 벽 파괴 실패!','#ef4444');
-    wallRef.current={state:'idle'};
-    wallHitCountRef.current=0;
     const t=(performance.now()-playStartRef.current)/1000;
-    chartRef.current.genUntil=Math.max(chartRef.current.genUntil, t+1.0);
-    setWallUI(null);
-    setWallWarning(false);
-    wallRef.current.pending=false;
+    const TRAVEL=Math.abs(SPAWN_Z-PLAYER_Z)/NOTE_SPEED;
+    const resumeT=t+TRAVEL+0.5;
+    chartRef.current.genUntil=Math.max(chartRef.current.genUntil, resumeT);
+    chartRef.current.notes=chartRef.current.notes.filter(n=>n.hit||n.missed||n.time>t+TRAVEL);
+    chartRef.current.obstacles=chartRef.current.obstacles.filter(o=>o.hit||o.time>t+TRAVEL);
+    setWallUI(null);setWallWarning(false);setWallVisible(false);setWallBreaking(false);
+    wallHitCountRef.current=0;
+    wallRef.current={state:'idle',pending:false};
   },[doDamage,showMsg,playStartRef,chartRef]);
 
   // 점수 모니터링: 3000점마다 벽 이벤트 트리거
@@ -1647,17 +1756,24 @@ function App(){
        &&wallRef.current.state==='idle'&&!wallRef.current.pending){
       lastWallScoreRef.current=milestone;
       wallRef.current.pending=true;
-      // 경고 1초 전부터 노트 차단: genUntil을 현재시간+2초+2초 앞으로
       const t=(performance.now()-playStartRef.current)/1000;
-      chartRef.current.genUntil=Math.max(chartRef.current.genUntil, t+3.5);
+      const TRAVEL=Math.abs(SPAWN_Z-PLAYER_Z)/NOTE_SPEED;
+      // 경고(1.9초) + 벽(5초) + 파괴후(TRAVEL+1.5초) 전체를 genUntil로 막음
+      const blockUntil=t+1.9+5+TRAVEL+1.5;
+      chartRef.current.genUntil=Math.max(chartRef.current.genUntil, blockUntil);
+      // 이미 생성된 노트/장애물 중 아직 안 맞은 것 모두 제거
+      chartRef.current.notes=chartRef.current.notes.filter(n=>n.hit||n.missed);
+      chartRef.current.obstacles=chartRef.current.obstacles.filter(o=>o.hit);
       setWallWarning(true);
       playWarningSiren();
       setTimeout(()=>setWallWarning(false),1800);
       setTimeout(()=>{
         if(wallRef.current.state==='idle'){
-          wallRef.current={state:'stopped'};
+          wallRef.current={state:'stopped',startTime:performance.now(),resetProg:Date.now()}; // 타이머+진행도 리셋
           wallHitCountRef.current=0;
           setWallUI({hits:0,breaking:false});
+          setWallVisible(true);
+          setWallBreaking(false);
         }
       },1900);
     }
@@ -1668,9 +1784,9 @@ function App(){
     showMsg(`🔢 ${m}의 배수로 변경!`,'#a78bfa');
   },[showMsg]);
 
-  const startGame=useCallback(async()=>{
+  const startGame=useCallback(()=>{
     if(!isCameraReady)return;
-    try{if(_actx&&_actx.state==='suspended')await _actx.resume();}catch(e){}
+    try{if(_actx&&_actx.state==='suspended')_actx.resume().catch(()=>{});}catch(e){}
     const m=MULT_OPTS[Math.floor(Math.random()*MULT_OPTS.length)];
     multRef.current=m;setMult(m);
     setScore(0);setCombo(0);comboRef.current=0;
@@ -1683,12 +1799,9 @@ function App(){
     wallHitCountRef.current=0;
     lastWallScoreRef.current=0;
     wallRef.current.pending=false;
-    setWallUI(null);setWallWarning(false);
-    setPlaying(false); // 잠깐 unmount
-    await new Promise(r=>setTimeout(r,30));
-    setPlaying(true);  // 새 chartRef로 remount
-    try{audioRef.current.currentTime=0;await audioRef.current.play();setGs(GS.PLAYING);}
-    catch(e){alert('오디오 재생 실패. 화면을 먼저 탭/클릭 후 다시 시도해주세요.');}
+    setWallUI(null);setWallWarning(false);setWallVisible(false);setWallBreaking(false);
+    setGs(GS.PLAYING);
+    try{audioRef.current.currentTime=0;audioRef.current.play().catch(()=>{});}catch(e){}
   },[isCameraReady]);
 
   useEffect(()=>{if(gs===GS.LOADING&&isCameraReady)setGs(GS.IDLE);},[isCameraReady,gs]);
@@ -1715,19 +1828,37 @@ function App(){
       <video ref={videoRef} style={{position:'absolute',opacity:0,pointerEvents:'none',width:640,height:480}} playsInline muted autoPlay/>
       {flash&&<div style={{position:'absolute',inset:0,background:'rgba(220,38,38,.48)',zIndex:60,pointerEvents:'none',animation:'dmgflash .32s ease-out forwards'}}/>}
 
+      {/* 전체화면 버튼 - 메뉴/결과 화면에서만 표시 */}
+      {(gs===GS.IDLE||gs===GS.GAME_OVER)&&(
+        <button onClick={()=>{
+          if(!document.fullscreenElement){document.documentElement.requestFullscreen().catch(()=>{});}
+          else{document.exitFullscreen().catch(()=>{});}
+        }} style={{position:'absolute',top:14,right:14,zIndex:50,
+          background:'rgba(0,0,0,.55)',border:'1px solid #374151',borderRadius:8,
+          padding:'7px 9px',cursor:'pointer',color:'#9ca3af',display:'flex',alignItems:'center',
+          justifyContent:'center'}}
+          title="전체화면 전환">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+          </svg>
+        </button>
+      )}
       <Canvas frameloop="always"
         dpr={[1, Math.min(window.devicePixelRatio??1, window.innerWidth<600?1.0:1.5)]}
         gl={{antialias:false,powerPreference:'high-performance',
              stencil:false,depth:true,alpha:false}} shadows={false}>
-        {gs===GS.PLAYING&&playing&&
-          <GameScene gameStatus={gs} audioRef={audioRef}
-            handDataRef={handDataRef} headPositionRef={headPositionRef}
-            chartRef={chartRef} multRef={multRef}
-            playStartRef={playStartRef}
-            onNoteHit={onHit} onNoteMiss={onMiss} onObstacleHit={onObsHit}
-            onMultChange={onMultChange}
-            wallRef={wallRef} onWallHit={onWallHit} onWallBreak={onWallBreak} onWallTimeout={onWallTimeout}/>
-        }
+        <color attach="background" args={['#05050a']}/>
+        {/* GameScene 항상 마운트 — unmount/remount 시 검정 깜박임 방지
+            gameKey 변경 시에도 key prop 제거하고 gameStatus로만 제어 */}
+        <GameScene gameStatus={gs} audioRef={audioRef}
+          handDataRef={handDataRef} headPositionRef={headPositionRef}
+          chartRef={chartRef} multRef={multRef}
+          playStartRef={playStartRef}
+          onNoteHit={onHit} onNoteMiss={onMiss} onObstacleHit={onObsHit}
+          onMultChange={onMultChange}
+          wallRef={wallRef} onWallHit={onWallHit} onWallBreak={onWallBreak} onWallTimeout={onWallTimeout}
+          wallVisible={wallVisible} wallBreaking={wallBreaking}
+          resetKey={gameKey}/>
       </Canvas>
 
       <WebcamPreview videoRef={videoRef} resultsRef={lastResultsRef} isCameraReady={isCameraReady}/>
@@ -1832,11 +1963,13 @@ function App(){
               </div>
             </div>
           </div>
-          <div style={{color:'#9ca3af',background:'rgba(0,0,0,.52)',padding:'5px 9px',borderRadius:7,
-            border:'1px solid #374151',display:'flex',alignItems:'center',gap:5,marginTop:3,...fs('1.8vw',10,12)}}>
-            <div style={{width:7,height:7,borderRadius:'50%',flexShrink:0,
-              background:headPositionRef?.current?.detected?'#4ade80':'#f87171'}}/>
-            머리 추적
+          <div style={{display:'flex',alignItems:'center',gap:5,marginTop:3}}>
+            <div style={{color:'#9ca3af',background:'rgba(0,0,0,.52)',padding:'5px 9px',borderRadius:7,
+              border:'1px solid #374151',display:'flex',alignItems:'center',gap:5,...fs('1.8vw',10,12)}}>
+              <div style={{width:7,height:7,borderRadius:'50%',flexShrink:0,
+                background:headPositionRef?.current?.detected?'#4ade80':'#f87171'}}/>
+              머리 추적
+            </div>
           </div>
         </div>
       )}
