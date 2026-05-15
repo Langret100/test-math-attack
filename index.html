@@ -47,7 +47,10 @@ const GS={LOADING:'LOADING',IDLE:'IDLE',PLAYING:'PLAYING',GAME_OVER:'GAME_OVER'}
 const COL={left:'#ef4444',right:'#3b82f6',correct:'#f59e0b',heart:'#ec4899',obstacle:'#ff4400'};
 const SPAWN_Z=-30,PLAYER_Z=0,MISS_Z=6,NOTE_SPEED=8;
 const BPM=140,BEAT=60/BPM;
-const _isMobile=()=>window.innerWidth<window.innerHeight;
+// 캐싱된 모바일 판별 — 매 프레임 window 접근 방지
+let _isMobileCache=window.innerWidth<window.innerHeight;
+const _isMobile=()=>_isMobileCache;
+window.addEventListener('resize',()=>{_isMobileCache=window.innerWidth<window.innerHeight;},{passive:true});
 const LANE_X_PC=[-1.5,-0.5,0.5,1.5];
 const LANE_X_MB=[-1.0,-0.34,0.34,1.0];
 const LAYER_Y_PC=[0.7,1.5,2.3];
@@ -504,8 +507,7 @@ function useMediaPipe(videoRef){
   const hlRef=useRef(null),fdRef=useRef(null),rafRef=useRef(0);
 
   const toWorld=(x,y)=>{
-    // 모바일/PC 모두 손이 화면 전체를 커버하도록 넓은 범위 매핑
-    const isMobile=window.innerWidth<window.innerHeight;
+    const isMobile=_isMobileCache;
     const xScale=isMobile?8.5:9.0;
     const yScale=isMobile?5.5:5.2;
     const yOff =isMobile?-1.6:-1.8;
@@ -534,7 +536,13 @@ function useMediaPipe(videoRef){
         });
         if(!active){hl.close();fd.close();return;}
         hlRef.current=hl;fdRef.current=fd;
-        const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}}});
+        const isMob=_isMobileCache;
+        const stream=await navigator.mediaDevices.getUserMedia({video:{
+          facingMode:'user',
+          width:{ideal:isMob?320:640},
+          height:{ideal:isMob?240:480},
+          frameRate:{ideal:isMob?30:60}
+        }});
         if(videoRef.current&&active){
           videoRef.current.srcObject=stream;
           videoRef.current.onloadeddata=()=>{
@@ -590,7 +598,11 @@ function useMediaPipe(videoRef){
           }catch(e){}
         }
       }
-      rafRef.current=requestAnimationFrame(loop);
+      // 모바일: 20ms(~50fps) setTimeout으로 Three.js rAF와 분리 → GPU 경합 없음
+      // PC: setTimeout(0)으로 매크로태스크 분리 (microtask보다 렌더 우선)
+      rafRef.current=_isMobileCache
+        ? setTimeout(loop,20)
+        : setTimeout(loop,0);
     }
 
     function processHands(hr){
@@ -598,7 +610,7 @@ function useMediaPipe(videoRef){
       const now=performance.now();
       const s=handDataRef.current;
       s.lastTs=now;
-      const isMobile=window.innerWidth<window.innerHeight;
+      const isMobile=_isMobileCache;
       const xScale=isMobile?9.0:14.0;   // 모바일: 좁은 화면에 맞게
       const yScale=isMobile?6.5:8.0;    // 모바일: 높이 범위 축소
       const yOff=isMobile?-0.8:-1.4;    // 모바일: 수직 중심 조정
@@ -655,7 +667,8 @@ function useMediaPipe(videoRef){
 
     setup();
     return()=>{
-      active=false;cancelAnimationFrame(rafRef.current);
+      active=false;
+      clearTimeout(rafRef.current);cancelAnimationFrame(rafRef.current);
       hlRef.current?.close();fdRef.current?.close();
       if(videoRef.current?.srcObject)videoRef.current.srcObject.getTracks().forEach(t=>t.stop());
     };
@@ -786,7 +799,7 @@ function Saber({type,handDataRef}){
         <meshStandardMaterial color="white" emissive={col} emissiveIntensity={1.8} toneMapped={false} transparent opacity={0.75}/>
       </mesh>
       <pointLight color={col} intensity={6} distance={7} decay={2} position={[0,1.4,0]}/>
-      <pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>
+      {!_isMobileCache&&<pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>}
     </group>
   );
 }
@@ -971,7 +984,8 @@ function HitEffect({color,hitTime,playStartRef,isGood,isPenalty}){
     g.current.visible=tsh<life&&tsh>=0;
   });
   const col=isPenalty?'#ff6600':isGood?color:'#cc8800';
-  const cnt=isGood?26:12; // 스파크 수 늘림
+  const baseCnt=isGood?26:12;
+  const cnt=_isMobileCache?Math.ceil(baseCnt*0.5):baseCnt; // 모바일: 파티클 50% 절감
   const sparks=useMemo(()=>Array.from({length:cnt},(_,i)=>{
     const a=(i/cnt)*Math.PI*2+(Math.random()-0.5)*0.3;
     const spd=isGood?(7+Math.random()*9):(4+Math.random()*5); // 더 빠르고 넓게
@@ -1073,7 +1087,7 @@ function NoteComp({data,playStartRef,multRef}){
   const isCorrect=!isHeart&&data.numVal!==0&&data.numVal%mult===0;
   const noteColor=data.type==='left'?COL.left:COL.right;
   const edgeCol=noteColor; // 테두리는 항상 노트 색 (빨강/파랑만)
-  const mob=_isMobile();
+  const mob=_isMobileCache;
   const nx=(mob?LANE_X_MB:LANE_X_PC)[data.lineIndex], ny=(mob?LAYER_Y_MB:LAYER_Y_PC)[data.lineLayer];
   const hitTimeRef=useRef(null);
   const visRef=useRef(true);
@@ -1138,7 +1152,7 @@ function NoteComp({data,playStartRef,multRef}){
       <lineSegments geometry={edgesGeo}>
         <lineBasicMaterial color={edgeCol} toneMapped={false}/>
       </lineSegments>
-      {isCorrect&&<pointLight color={COL.correct} intensity={0.9} distance={2.2} decay={2}/>}
+      {isCorrect&&!_isMobileCache&&<pointLight color={COL.correct} intensity={0.9} distance={2.2} decay={2}/>}
     </group>
   );
 }
@@ -1210,7 +1224,14 @@ function WebcamPreview({videoRef,resultsRef,isCameraReady}){
   const cv=useRef();
   useEffect(()=>{
     if(!isCameraReady)return;let af;
-    const draw=()=>{
+    // 모바일: 15fps로 드로우 (게임 렌더 부하 우선)
+    const TARGET_FPS=_isMobileCache?15:30;
+    const INTERVAL=1000/TARGET_FPS;
+    let lastDraw=0;
+    const draw=(ts)=>{
+      af=requestAnimationFrame(draw);
+      if(ts-lastDraw<INTERVAL)return; // throttle
+      lastDraw=ts;
       const c=cv.current,v=videoRef.current;
       if(c&&v&&v.readyState>=2){
         const W=c.width,H=c.height,ctx=c.getContext('2d');
@@ -1228,17 +1249,23 @@ function WebcamPreview({videoRef,resultsRef,isCameraReady}){
           }
         }
       }
-      af=requestAnimationFrame(draw);
     };
-    draw();return()=>cancelAnimationFrame(af);
+    af=requestAnimationFrame(draw);return()=>cancelAnimationFrame(af);
   },[isCameraReady,videoRef,resultsRef]);
   if(!isCameraReady)return null;
+  const isMob=_isMobileCache;
   return(
-    <div style={{position:'fixed',bottom:8,right:8,width:'clamp(110px,16vw,190px)',aspectRatio:'4/3',
-      border:'2px solid rgba(59,130,246,.45)',borderRadius:9,overflow:'hidden',zIndex:50,pointerEvents:'none',background:'#000'}}>
+    <div style={{position:'fixed',
+      bottom: isMob?'auto':8,
+      top: isMob?8:'auto',
+      right:8,
+      width: isMob?'clamp(70px,18vw,100px)':'clamp(110px,16vw,190px)',
+      aspectRatio:'4/3',
+      border:'2px solid rgba(59,130,246,.45)',borderRadius:9,overflow:'hidden',zIndex:50,pointerEvents:'none',background:'#000',
+      opacity: isMob?0.75:1}}>
       <div style={{position:'absolute',top:0,left:0,right:0,zIndex:1,background:'rgba(0,0,0,.6)',
-        fontSize:9,color:'rgba(147,197,253,.8)',padding:'2px 6px',fontFamily:'monospace',letterSpacing:2}}>CAMERA</div>
-      <canvas ref={cv} width={320} height={240} style={{display:'block',width:'100%',height:'100%',marginTop:14}}/>
+        fontSize:8,color:'rgba(147,197,253,.8)',padding:'2px 4px',fontFamily:'monospace',letterSpacing:1}}>CAM</div>
+      <canvas ref={cv} width={isMob?160:320} height={isMob?120:240} style={{display:'block',width:'100%',height:'100%',marginTop:12}}/>
     </div>
   );
 }
@@ -1288,9 +1315,10 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
     }
     if(shk.current>0&&camRef.current){
       const sh=shk.current;
-      camRef.current.position.set((Math.random()-.5)*sh,1.8+(Math.random()-.5)*sh,4+(Math.random()-.5)*sh);
+      const cy=_isMobileCache?1.5:1.8, cz=_isMobileCache?3.2:4;
+      camRef.current.position.set((Math.random()-.5)*sh,cy+(Math.random()-.5)*sh,cz+(Math.random()-.5)*sh);
       shk.current=THREE.MathUtils.lerp(shk.current,0,14*dt);
-      if(shk.current<0.01){shk.current=0;camRef.current.position.set(0,1.8,4);}
+      if(shk.current<0.01){shk.current=0;camRef.current.position.set(0,cy,cz);}
     }
     if(gameStatus!==GS.PLAYING||!audioRef.current)return;
     const time=(performance.now()-playStartRef.current)/1000;
@@ -1357,9 +1385,9 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       const cz=PLAYER_Z-(n.time-time)*NOTE_SPEED;
       if(cz<PLAYER_Z-7.0)continue;
       if(cz>MISS_Z){n.missed=true;onNoteMiss(n);anyChange=true;continue;}
-      // 판정창 안에 있을 때만 히트 체크
+      // 히트 판정창 안에 있을 때만 히트 체크
       if(cz>PLAYER_Z-HIT_WIN&&cz<PLAYER_Z+HIT_WIN){
-        const mobO=_isMobile();
+        const mobO=_isMobileCache; // 캐시값 사용 (매 프레임 window 접근 방지)
         const nx=(mobO?LANE_X_MB:LANE_X_PC)[n.lineIndex],ny=(mobO?LAYER_Y_MB:LAYER_Y_PC)[n.lineLayer];
         const isCorrect=n.noteType==='heart'||(n.numVal!==0&&n.numVal%mult===0);
         let hitHand=null,hitVel=null;
@@ -1393,7 +1421,7 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
           // 얼굴 미감지 → 피한 것으로 간주 (페널티 없음)
           o.hit=true; // 통과 처리
         } else {
-          const isMob=window.innerWidth<window.innerHeight;
+          const isMob=_isMobileCache; // 캐시값 사용
           // top 장애물: 머리 안 숙이면(y가 작으면=화면 위쪽) 맞음
           // left 장애물: 머리 오른쪽으로 안 피하면(x가 작으면=왼쪽에 있으면) 맞음
           // right 장애물: 머리 왼쪽으로 안 피하면(x가 크면=오른쪽에 있으면) 맞음
@@ -1427,11 +1455,12 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
 
   const isPlaying=gameStatus===GS.PLAYING;
   const isActive=isPlaying||(gameStatus&&gameStatus!=='LOADING');
+  const isMob=_isMobileCache;
   return(
     <>
       <PerspectiveCamera ref={camRef} makeDefault
-        position={[0, _isMobile()?1.5:1.8, _isMobile()?3.2:4]}
-        fov={_isMobile()?78:65}/>
+        position={[0, isMob?1.5:1.8, isMob?3.2:4]}
+        fov={isMob?78:65}/>
       {/* 배경/조명/별 - IDLE부터 미리 렌더해서 게임시작 깜박임 방지 */}
       {isActive&&<>
         <fog   attach="fog"        args={['#05050a',14,50]}/>
@@ -1442,7 +1471,7 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
         <mesh rotation={[-Math.PI/2,0,0]} position={[0,-0.01,0]}>
           <planeGeometry args={[4,80]}/><meshStandardMaterial color="#07070d" roughness={1} metalness={0}/>
         </mesh>
-        <Stars radius={40} depth={40} count={350} factor={3} saturation={0} fade speed={0.4}/>
+        <Stars radius={40} depth={40} count={_isMobileCache?150:350} factor={3} saturation={0} fade speed={0.4}/>
       </>}
       {/* 게임 오브젝트 - PLAYING일 때만 */}
       {isPlaying&&<>
@@ -1519,7 +1548,7 @@ function HandButton({label,onActivate,handDataRef,color='#2563eb',icon='▶'}){
       lastT=now;
       const rect=btn.getBoundingClientRect();
       const hd=handDataRef.current;
-      const isMobile=window.innerWidth<window.innerHeight;
+      const isMobile=_isMobileCache;
       const xScale=isMobile?13.0:14.0, yScale=isMobile?8.5:8.0, yOff=isMobile?-1.2:-1.4;
       const W=window.innerWidth, H=window.innerHeight;
       const PAD=44;
@@ -1584,7 +1613,7 @@ function HandCursor({handDataRef}){
   const dotRefs=[useRef(),useRef()];
   const containerRef=useRef();
   useEffect(()=>{
-    const isMobile=window.innerWidth<window.innerHeight;
+    const isMobile=_isMobileCache;
     const xScale=isMobile?13.0:14.0;
     const yScale=isMobile?8.5:8.0;
     const yOff=isMobile?-1.2:-1.4;
@@ -1819,8 +1848,12 @@ function App(){
   const fs=(b,mn=10,mx=999)=>({fontSize:`clamp(${mn}px,${b},${mx}px)`});
   const panel=(ch,ex={})=>(
     <div style={{background:'rgba(4,4,10,.93)',borderRadius:18,border:'2px solid rgba(59,130,246,.2)',
-      padding:'clamp(18px,4vw,34px) clamp(18px,4.5vw,36px)',textAlign:'center',
-      backdropFilter:'blur(16px)',width:'clamp(300px,90vw,460px)',...ex}}>{ch}</div>
+      padding:'clamp(14px,3.5vw,34px) clamp(14px,4vw,36px)',textAlign:'center',
+      backdropFilter:'blur(16px)',
+      width: _isMobileCache?'clamp(280px,95vw,400px)':'clamp(300px,90vw,460px)',
+      maxHeight: _isMobileCache?'90vh':'auto',
+      overflowY: _isMobileCache?'auto':'visible',
+      ...ex}}>{ch}</div>
   );
 
   return(
@@ -1844,7 +1877,7 @@ function App(){
         </button>
       )}
       <Canvas frameloop="always"
-        dpr={[1, Math.min(window.devicePixelRatio??1, window.innerWidth<600?1.0:1.5)]}
+        dpr={[1, _isMobileCache ? 1.0 : Math.min(window.devicePixelRatio??1, 1.5)]}
         gl={{antialias:false,powerPreference:'high-performance',
              stencil:false,depth:true,alpha:false}} shadows={false}>
         <color attach="background" args={['#05050a']}/>
@@ -1881,7 +1914,7 @@ function App(){
       {gs===GS.PLAYING&&wallUI&&!wallUI.breaking&&!wallWarning&&(
         <div style={{position:'fixed',top:0,left:0,right:0,bottom:0,
           display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'flex-start',
-          paddingTop:'12%',
+          paddingTop: _isMobileCache?'8%':'12%',
           zIndex:40,pointerEvents:'none',textAlign:'center'}}>
           <div style={{animation:'warnpulse .5s ease-in-out infinite'}}>
             <div style={{fontSize:'clamp(18px,4vw,30px)',color:'#ffcc00',fontWeight:900,
@@ -1919,14 +1952,18 @@ function App(){
       )}
 
       {gs===GS.PLAYING&&(
-        <div style={{position:'absolute',top:0,left:0,right:0,padding:'clamp(9px,2vw,16px) clamp(11px,2.3vw,20px)',
+        <div style={{position:'absolute',top:0,left:0,right:0,
+          padding: _isMobileCache
+            ? 'clamp(6px,1.5vw,10px) clamp(8px,2vw,14px)'
+            : 'clamp(9px,2vw,16px) clamp(11px,2.3vw,20px)',
           display:'flex',justifyContent:'space-between',alignItems:'flex-start',pointerEvents:'none',zIndex:10}}>
           <div>
             <Hearts count={hearts}/>
-            <div style={{color:'#9ca3af',...fs('2vw',10,12),marginTop:2}}>라이프</div>
+            <div style={{color:'#9ca3af',...fs(_isMobileCache?'2.5vw':'2vw',9,12),marginTop:2}}>라이프</div>
           </div>
           <div style={{textAlign:'center'}}>
-            <div style={{fontWeight:700,color:'#fff',lineHeight:1,textShadow:'0 0 10px rgba(59,130,246,.7)',...fs('5vw',20,44)}}>{score.toLocaleString()}</div>
+            <div style={{fontWeight:700,color:'#fff',lineHeight:1,textShadow:'0 0 10px rgba(59,130,246,.7)',
+              ...(  _isMobileCache ? fs('6.5vw',18,36) : fs('5vw',20,44))}}>{score.toLocaleString()}</div>
             {combo>0&&(()=>{
               const tier=combo>=50?4:combo>=25?3:combo>=10?2:combo>=5?1:0;
               const colors=['#d1d5db','#60a5fa','#fbbf24','#f97316','#a855f7'];
@@ -1958,8 +1995,8 @@ function App(){
               <div style={{lineHeight:1,display:'flex',alignItems:'baseline',justifyContent:'center',gap:'0.15em'}}>
                 <span style={{color:'#fbbf24',fontWeight:900,
                   textShadow:'0 0 18px rgba(251,191,36,0.7)',
-                  ...fs('7vw',30,52)}}>{mult}</span>
-                <span style={{color:'rgba(251,191,36,0.7)',fontWeight:700,...fs('3vw',13,20)}}>의 배수</span>
+                  ...(_isMobileCache ? fs('9vw',28,44) : fs('7vw',30,52))}}>{mult}</span>
+                <span style={{color:'rgba(251,191,36,0.7)',fontWeight:700,...(_isMobileCache?fs('3.5vw',12,18):fs('3vw',13,20))}}>의 배수</span>
               </div>
             </div>
           </div>
