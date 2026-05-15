@@ -7,8 +7,11 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body,html,#root{width:100%;height:100%;overflow:hidden;background:#000;touch-action:none;font-family:system-ui,sans-serif}
+    body,html,#root{width:100%;height:100%;overflow:hidden;background:#05050a;touch-action:none;font-family:system-ui,sans-serif}
     canvas{outline:none;display:block}
+    /* GPU 레이어 미리 확보 → 첫 렌더 깜박임 방지 */
+    #root{will-change:transform;contain:strict;}
+    .r3f-canvas{will-change:transform;}
     @keyframes spin{to{transform:rotate(360deg)}}
     @keyframes dmgflash{0%{opacity:.65}100%{opacity:0}}
     @keyframes msgpop{0%{opacity:0;transform:translate(-50%,-10px) scale(.8)}20%{opacity:1;transform:translate(-50%,0) scale(1.1)}85%{opacity:1}100%{opacity:0;transform:translate(-50%,8px) scale(.9)}}
@@ -47,15 +50,38 @@ const GS={LOADING:'LOADING',IDLE:'IDLE',PLAYING:'PLAYING',GAME_OVER:'GAME_OVER'}
 const COL={left:'#ef4444',right:'#3b82f6',correct:'#f59e0b',heart:'#ec4899',obstacle:'#ff4400'};
 const SPAWN_Z=-30,PLAYER_Z=0,MISS_Z=6,NOTE_SPEED=8;
 const BPM=140,BEAT=60/BPM;
-// 캐싱된 모바일 판별 — 매 프레임 window 접근 방지
-let _isMobileCache=window.innerWidth<window.innerHeight;
+// ── 기기 티어 판별 (phone / tablet / desktop) ──
+// phone:   짧은 변 < 600px  → 스마트폰
+// tablet:  짧은 변 600~1024px → 태블릿 (iPad, Android 태블릿)
+// desktop: 짧은 변 > 1024px → PC / 대형 태블릿
+function _calcTier(){
+  const sw=Math.min(window.innerWidth,window.innerHeight); // 짧은 변 기준
+  if(sw<600)return'phone';
+  if(sw<1024)return'tablet';
+  return'desktop';
+}
+let _tier=_calcTier();
+window.addEventListener('resize',()=>{
+  _tier=_calcTier();
+  _isMobileCache=_tier==='phone';
+},{passive:true});
+const _isPhone=()=>_tier==='phone';
+const _isTablet=()=>_tier==='tablet';
+const _isDesktop=()=>_tier==='desktop';
+// 기존 _isMobileCache: phone 전용 (태블릿은 포함 안 함)
+let _isMobileCache=_tier==='phone';
 const _isMobile=()=>_isMobileCache;
-window.addEventListener('resize',()=>{_isMobileCache=window.innerWidth<window.innerHeight;},{passive:true});
+// 실제 터치 입력 기기 판별 (pointer:coarse = 손가락 터치, pointer:fine = 마우스/트랙패드)
+// 웨일북/크롬북은 트랙패드 → pointer:fine → false → PC처럼 최대 성능
+const _hasTouchPointer=window.matchMedia('(pointer:coarse)').matches;
+const _isTouchDevice=()=>_hasTouchPointer;
 const LANE_X_PC=[-1.5,-0.5,0.5,1.5];
 const LANE_X_MB=[-1.0,-0.34,0.34,1.0];
+const LANE_X_TB=[-1.3,-0.44,0.44,1.3]; // 태블릿
 const LAYER_Y_PC=[0.7,1.5,2.3];
 const LAYER_Y_MB=[0.5,1.3,2.1];
-const LANE_X=LANE_X_PC; // 런타임에 동적 사용
+const LAYER_Y_TB=[0.6,1.4,2.2]; // 태블릿
+const LANE_X=LANE_X_PC;
 const LAYER_Y=LAYER_Y_PC;
 const MULT_OPTS=[2,3,4,5,6,7,8,9,10];
 const MAX_HEARTS=3;
@@ -68,6 +94,44 @@ const SONG_URL='https://commondatastorage.googleapis.com/codeskulptor-demos/rice
 const WALL_HITS_NEEDED=20;
 const WALL_SPAWN_Z=-1.5; // 바로 플레이어 앞에 팝업
 const WALL_TIME_LIMIT=5; // 5초 안에 못 부수면 하트 감소
+
+// ══════════════════════════════════════
+// 통합 파티클 풀 매니저
+// 모바일: Spark/Particle/StarSpark/WallParticle 모두 이 단일 useFrame으로 처리
+// → 히트마다 useFrame N개 추가되던 것을 useFrame 1개로 통합
+// ══════════════════════════════════════
+const _particlePool=[];       // {mesh, t, life, update(mesh,t,dt,f)}
+const _particleRefs=[];       // mesh ref 등록용
+let _particlePoolReady=false;
+
+// 파티클 등록 (컴포넌트 마운트 시 호출)
+function _regParticle(mesh, life, updateFn){
+  mesh.userData._pLife=life;
+  mesh.userData._pT=-1; // -1=대기
+  mesh.userData._pUpdate=updateFn;
+  _particlePool.push(mesh);
+}
+// 파티클 시작 (히트 시 호출)
+function _startParticle(mesh){
+  if(mesh){mesh.userData._pT=0;mesh.visible=true;}
+}
+
+// 파티클 풀 전체를 처리하는 단일 useFrame 컴포넌트
+function ParticlePoolDriver(){
+  useFrame((_,dt)=>{
+    for(let i=0;i<_particlePool.length;i++){
+      const m=_particlePool[i];
+      if(!m||m.userData._pT<0)continue;
+      m.userData._pT+=dt;
+      const t=m.userData._pT;
+      const life=m.userData._pLife;
+      if(t>life){m.visible=false;m.userData._pT=-1;continue;}
+      const f=t/life;
+      m.userData._pUpdate(m,t,dt,f);
+    }
+  });
+  return null;
+}
 
 // geometry 캐싱 (매 프레임 생성 방지 → 렉 제거)
 const _wallBodyGeo=new THREE.BoxGeometry(5.2,3.2,0.28);
@@ -105,22 +169,23 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
   const progRef=useRef(0);
   const hpRef=useRef(); // HP바 mesh ref
   const timerRef=useRef(0); // 경과 시간
-  const sparks=useRef([]); // 불꽃 파티클 [{x,y,dx,dy,t,life}]
-  const sparkMeshes=useRef([]); // 파티클 mesh refs (고정 풀)
-  const SPARK_POOL=24; // 풀 크기
+  const sparks=useRef([]);
+  const sparkMeshes=useRef([]);
+  const SPARK_POOL=_isMobileCache?12:_isTablet()?18:24;
 
   // 균열/벽돌 위치 고정 (useMemo로 한번만 계산)
-  const crackSeeds=useMemo(()=>Array.from({length:14},(_,i)=>({
+  const crackSeeds=useMemo(()=>Array.from({length:_isMobileCache?8:_isTablet()?11:14},(_,i)=>({
     x:(Math.random()-0.5)*4.2, y:(Math.random()-0.5)*2.8,
     len:0.3+Math.random()*0.9, angle:Math.random()*Math.PI,
   })),[]);
   const brickPositions=useMemo(()=>{
     const arr=[];
-    for(let row=0;row<5;row++)for(let col=0;col<4;col++)
+    const rows=_isMobileCache?3:_isTablet()?4:5, cols=_isMobileCache?3:_isTablet()?3:4;
+    for(let row=0;row<rows;row++)for(let col=0;col<cols;col++)
       arr.push([col*1.3-1.95, row*0.64-1.28]);
     return arr;
   },[]);
-  const debrisData=useMemo(()=>Array.from({length:30},(_,i)=>({
+  const debrisData=useMemo(()=>Array.from({length:_isMobileCache?14:_isTablet()?22:30},(_,i)=>({
     dx:(Math.random()-0.5)*3, dy:0.5+Math.random()*2,
     speed:3+Math.random()*6, size:0.12+Math.random()*0.22,
     life:0.6+Math.random()*0.5,
@@ -249,8 +314,10 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
     <group ref={grp} position={[0,1.5,WALL_SPAWN_Z]}>
       {/* 벽 본체 */}
       <mesh geometry={_wallBodyGeo}>
-        <meshStandardMaterial color='#0d0d0d' roughness={0.9} metalness={0.05}
-          emissive='#1a0a0a' emissiveIntensity={0.4}/>
+        {_isMobileCache
+          ?<meshBasicMaterial color='#1a0808' transparent opacity={0.92}/>
+          :<meshStandardMaterial color='#0d0d0d' roughness={0.9} metalness={0.05}
+              emissive='#1a0a0a' emissiveIntensity={0.4}/>}
       </mesh>
       {/* 벽돌 패턴 (edges 캐싱) */}
       {brickPositions.map(([bx,by],i)=>(
@@ -507,17 +574,17 @@ function useMediaPipe(videoRef){
   const hlRef=useRef(null),fdRef=useRef(null),rafRef=useRef(0);
 
   const toWorld=(x,y)=>{
-    const isMobile=_isMobileCache;
-    const xScale=isMobile?8.5:9.0;
-    const yScale=isMobile?5.5:5.2;
-    const yOff =isMobile?-1.6:-1.8;
+    const xScale=_tier==='phone'?8.5:_tier==='tablet'?9.5:9.0;
+    const yScale=_tier==='phone'?5.5:_tier==='tablet'?5.8:5.2;
+    const yOff  =_tier==='phone'?-1.6:_tier==='tablet'?-1.7:-1.8;
     const wx=(0.5-x)*xScale;
     const wy=(1-y)*yScale+yOff;
     return new THREE.Vector3(wx,Math.max(-0.5,wy),0);
   };
 
   useEffect(()=>{
-    let active=true,hlTs=0,fdTs=0,fdFrame=0;
+    let active=true,hlTs=0,fdTs=0;
+    let fdTimer=null;
 
     async function setup(){
       try{
@@ -537,11 +604,12 @@ function useMediaPipe(videoRef){
         if(!active){hl.close();fd.close();return;}
         hlRef.current=hl;fdRef.current=fd;
         const isMob=_isMobileCache;
+        const isTouchDev=_isTouchDevice();
         const stream=await navigator.mediaDevices.getUserMedia({video:{
           facingMode:'user',
-          width:{ideal:isMob?320:640},
-          height:{ideal:isMob?240:480},
-          frameRate:{ideal:isMob?30:60}
+          width:{ideal:isMob?320:isTouchDev?480:640},
+          height:{ideal:isMob?240:isTouchDev?360:480},
+          frameRate:{ideal:isMob?30:isTouchDev?30:60}
         }});
         if(videoRef.current&&active){
           videoRef.current.srcObject=stream;
@@ -558,13 +626,42 @@ function useMediaPipe(videoRef){
                 }
               }catch(e){}
               setReady(true);
-              loop();
+              fdLoop(); // 얼굴 감지 별도 루프 시작
+              loop();   // 손 감지 루프 시작
             },200);
           };
         }
       }catch(e){console.error(e);setErr(e.message);}
     }
 
+    // 얼굴 감지: 완전 별도 타이머 (모바일 8fps=125ms, PC 10fps=100ms)
+    // → 손+얼굴 동기 detectForVideo 이중 호출로 인한 프레임 스파이크 제거
+    function fdLoop(){
+      if(!active||!fdRef.current||!videoRef.current)return;
+      const v=videoRef.current;
+      if(v.videoWidth>0&&v.readyState>=2){
+        try{
+          const fdNow=Math.floor(performance.now());
+          if(fdNow>fdTs){
+            fdTs=fdNow;
+            const fr=fdRef.current.detectForVideo(v,fdTs);
+            if(fr.detections?.length>0){
+              const bb=fr.detections[0].boundingBox;
+              const W=v.videoWidth,H=v.videoHeight;
+              const cx=(bb.originX+bb.width*0.5)/W;
+              const cy=(bb.originY+bb.height*0.5)/H;
+              const bh=bb.height/H;
+              headRef.current={x:1-cx,y:cy,h:bh,detected:true};
+            }else{
+              headRef.current={...headRef.current,detected:false};
+            }
+          }
+        }catch(e){}
+      }
+      fdTimer=setTimeout(fdLoop, _isMobileCache?125:_isTablet()?110:100);
+    }
+
+    // 손 감지: 모바일 33ms(~30fps), PC 0ms(최대속도)
     function loop(){
       if(!videoRef.current||!hlRef.current||!active)return;
       const v=videoRef.current;
@@ -572,36 +669,9 @@ function useMediaPipe(videoRef){
         hlTs=Math.max(hlTs+1,Math.floor(performance.now()));
         try{const hr=hlRef.current.detectForVideo(v,hlTs);lrRef.current=hr;processHands(hr);}
         catch(e){hlTs+=2;}
-
-        // 얼굴: 4프레임마다 (실제 ms 타임스탬프 사용)
-        fdFrame++;
-        if(fdFrame%4===0&&fdRef.current){
-          try{
-            const fdNow=Math.floor(performance.now());
-            if(fdNow>fdTs){
-              fdTs=fdNow;
-              const fr=fdRef.current.detectForVideo(v,fdTs);
-              if(fr.detections?.length>0){
-                const bb=fr.detections[0].boundingBox;
-                const W=v.videoWidth,H=v.videoHeight;
-                const cx=(bb.originX+bb.width*0.5)/W;
-                const cy=(bb.originY+bb.height*0.5)/H;
-                const bh=bb.height/H;
-                // 미러보정: x 반전, y는 그대로 (0=상단, 1=하단)
-                headRef.current={x:1-cx,y:cy,h:bh,detected:true};
-              }else{
-                // 얼굴 미감지 시 이전 좌표 유지하되 detected=false
-                // → 장애물 판정 시 미감지면 자동 통과 (페널티 없음)
-                headRef.current={...headRef.current,detected:false};
-              }
-            }
-          }catch(e){}
-        }
       }
-      // 모바일: 20ms(~50fps) setTimeout으로 Three.js rAF와 분리 → GPU 경합 없음
-      // PC: setTimeout(0)으로 매크로태스크 분리 (microtask보다 렌더 우선)
-      rafRef.current=_isMobileCache
-        ? setTimeout(loop,20)
+      rafRef.current=_isTouchDevice()
+        ? setTimeout(loop,33)
         : setTimeout(loop,0);
     }
 
@@ -611,9 +681,9 @@ function useMediaPipe(videoRef){
       const s=handDataRef.current;
       s.lastTs=now;
       const isMobile=_isMobileCache;
-      const xScale=isMobile?9.0:14.0;   // 모바일: 좁은 화면에 맞게
-      const yScale=isMobile?6.5:8.0;    // 모바일: 높이 범위 축소
-      const yOff=isMobile?-0.8:-1.4;    // 모바일: 수직 중심 조정
+      const xScale=isMobile?9.0:_isTablet()?11.0:14.0;
+      const yScale=isMobile?6.5:_isTablet()?7.0:8.0;
+      const yOff=isMobile?-0.8:_isTablet()?-1.0:-1.4;
 
       let gotL=false,gotR=false;
       // 같은 side 중복 감지 시 신뢰도 높은 것만 채택 (좌우 꼬임 방지)
@@ -668,7 +738,7 @@ function useMediaPipe(videoRef){
     setup();
     return()=>{
       active=false;
-      clearTimeout(rafRef.current);cancelAnimationFrame(rafRef.current);
+      clearTimeout(rafRef.current);clearTimeout(fdTimer);cancelAnimationFrame(rafRef.current);
       hlRef.current?.close();fdRef.current?.close();
       if(videoRef.current?.srcObject)videoRef.current.srcObject.getTracks().forEach(t=>t.stop());
     };
@@ -754,6 +824,22 @@ function Saber({type,handDataRef}){
   });
 
   // 손잡이 상세 구성: 하단 손잡이 + 가드 + 블레이드
+  if(_isMobileCache){
+    // 모바일: mesh 2개로 단순화 (손잡이 1 + 블레이드 글로우 1)
+    return(
+      <group ref={grp}>
+        <mesh position={[0,-0.18,0]}>
+          <cylinderGeometry args={[0.035,0.030,0.36,6]}/>
+          <meshBasicMaterial color="#222"/>
+        </mesh>
+        <mesh ref={glowRef} position={[0,0.09+L/2,0]}>
+          <capsuleGeometry args={[0.044,L,6,8]}/>
+          <meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
+        </mesh>
+        <pointLight color={col} intensity={5} distance={6} decay={2} position={[0,1.2,0]}/>
+      </group>
+    );
+  }
   return(
     <group ref={grp}>
       {/* ── 손잡이 (하단) ── */}
@@ -822,7 +908,20 @@ const BAD_DIRS=(()=>{
 // 단일 파티클 (useRef 기반, re-render 없음)
 function Particle({dx,dy,speed,size,color,life,gravity=true,spin=0,delay=0}){
   const r=useRef();
-  useFrame((_,dt)=>{
+  useEffect(()=>{
+    if(!_isMobileCache||!r.current)return;
+    _regParticle(r.current, life+delay, (m,t,dt,f)=>{
+      const rt=t-delay; if(rt<0){m.visible=false;return;}
+      const rf=rt/life;
+      const grav=gravity?-6*rt*rt:0;
+      m.position.set(dx*speed*rt,dy*speed*rt+grav,spin?Math.sin(rt*8+spin)*0.3:0);
+      m.scale.setScalar(Math.max(0.01,(1-rf*rf)*1.2));
+      if(m.material)m.material.opacity=Math.max(0,1-rf*1.4);
+      m.visible=true;
+    });
+    _startParticle(r.current);
+  },[]);
+  useFrame(_isMobileCache?()=>{}:(_,dt)=>{
     if(!r.current)return;
     const t=r.current.userData.t=(r.current.userData.t??-delay)+dt;
     if(t<0){r.current.visible=false;return;}
@@ -834,16 +933,12 @@ function Particle({dx,dy,speed,size,color,life,gravity=true,spin=0,delay=0}){
     r.current.scale.setScalar(Math.max(0.01,(1-f*f)*1.2));
     if(r.current.material)r.current.material.opacity=Math.max(0,1-f*1.4);
   });
-  return(
-    <mesh ref={r}>
-      <sphereGeometry args={[size,5,5]}/>
-      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/>
-    </mesh>
-  );
+  return(<mesh ref={r}><sphereGeometry args={[size,_isMobileCache?3:5,_isMobileCache?3:5]}/><meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/></mesh>);
 }
 
-// 별 모양 스파크 (빠르게 튀어나가는 것)
+// 별 모양 스파크 — 모바일에서 렌더 생략
 function StarSpark({angle,speed,color,life,size=0.09}){
+  if(_isMobileCache)return null;
   const r=useRef();
   const ax=Math.cos(angle),ay=Math.sin(angle);
   useFrame((_,dt)=>{
@@ -867,8 +962,9 @@ function StarSpark({angle,speed,color,life,size=0.09}){
   );
 }
 
-// 팽창 링 (useFrame으로 크기 변경)
+// 팽창 링 — 모바일에서 렌더 생략
 function ExpandRing({color,speed,maxR,life,axis='z'}){
+  if(_isMobileCache)return null;
   const r=useRef();
   useFrame((_,dt)=>{
     if(!r.current)return;
@@ -888,8 +984,9 @@ function ExpandRing({color,speed,maxR,life,axis='z'}){
   );
 }
 
-// tsh를 자체 계산하는 단순 구체 메시
+// tsh를 자체 계산하는 단순 구체 메시 — 모바일 생략
 function TshMesh({color,opacity0,scale0,life,hitTime,playStartRef,back=false}){
+  if(_isMobileCache)return null;
   const r=useRef();
   useFrame(()=>{
     if(!r.current)return;
@@ -905,8 +1002,9 @@ function TshMesh({color,opacity0,scale0,life,hitTime,playStartRef,back=false}){
     </mesh>
   );
 }
-// 빛줄기 컴포넌트
+// 빛줄기 컴포넌트 — 모바일 생략
 function GlowRay({rot,color,hitTime,playStartRef}){
+  if(_isMobileCache)return null;
   const r=useRef();
   useFrame(()=>{
     if(!r.current)return;
@@ -917,42 +1015,56 @@ function GlowRay({rot,color,hitTime,playStartRef}){
     r.current.visible=tsh<0.4&&tsh>=0;
   });
   return(
-    <mesh ref={r} rotation={[0,0,rot]}>
-      <boxGeometry args={[0.05,3.2,0.04]}/>
+    <mesh ref={r} rotation={[0,0,rot]} geometry={_glowRayGeo}>
       <meshBasicMaterial color={color} toneMapped={false} transparent opacity={0.9}/>
     </mesh>
   );
 }
 
+const _glowRayGeo=new THREE.BoxGeometry(0.05,3.2,0.04);
 // 불꽃 스파크 이펙트 — 베었을 때 불꽃이 튀듯
 // geometry 캐싱
 const _sparkGeo=new THREE.PlaneGeometry(1,1); // scale로 조절
 
+// 불꽃 스파크 이펙트
 function Spark({dx,dy,speed,color,life,delay=0}){
   const r=useRef();
-  useFrame((_,dt)=>{
+  // PC: 기존 개별 useFrame / 모바일: 풀 등록
+  useEffect(()=>{
+    if(!_isMobileCache||!r.current)return;
+    _regParticle(r.current, life+delay, (m,t,dt,f)=>{
+      const rt=t-delay;
+      if(rt<0){m.visible=false;return;}
+      const rf=rt/(life);
+      const ease=Math.pow(Math.max(0,1-rf),0.4);
+      const grav=-8*rt*rt;
+      m.position.set(dx*speed*ease*rt, dy*speed*ease*rt+grav, (Math.random()-0.5)*0.05);
+      m.rotation.z=Math.atan2(dy,dx)+Math.PI/2;
+      const w=Math.max(0.001,0.012*(1-rf*rf));
+      const h=Math.max(0.001,(0.08+0.12*ease)*(1-rf*1.2));
+      m.scale.set(w,h,1);
+      if(m.material)m.material.opacity=Math.max(0,1-rf*rf*1.6);
+      m.visible=true;
+    });
+    _startParticle(r.current);
+  },[]);
+  useFrame(_isMobileCache?()=>{}:(_,dt)=>{
     if(!r.current)return;
     const t=(r.current.userData.t=(r.current.userData.t??-delay)+dt);
     if(t<0){r.current.visible=false;return;}
     if(t>life){r.current.visible=false;return;}
     r.current.visible=true;
     const f=t/life;
-    // 초반 빠르게 튀고 중력으로 낙하
-    const ease=Math.pow(1-f,0.4); // 감속
+    const ease=Math.pow(1-f,0.4);
     const grav=-8*t*t;
     r.current.position.set(dx*speed*ease*t, dy*speed*ease*t+grav, (Math.random()-0.5)*0.05);
-    // 가늘고 긴 스파크 모양 (방향 따라 회전)
     r.current.rotation.z=Math.atan2(dy,dx)+Math.PI/2;
     const w=Math.max(0.001,0.012*(1-f*f));
     const h=Math.max(0.001,(0.08+0.12*ease)*(1-f*1.2));
     r.current.scale.set(w,h,1);
     if(r.current.material)r.current.material.opacity=Math.max(0,1-f*f*1.6);
   });
-  return(
-    <mesh ref={r} geometry={_sparkGeo}>
-      <meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/>
-    </mesh>
-  );
+  return(<mesh ref={r} geometry={_sparkGeo}><meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/></mesh>);
 }
 
 // 순간 플래시 디스크 (geometry 캐싱)
@@ -985,7 +1097,7 @@ function HitEffect({color,hitTime,playStartRef,isGood,isPenalty}){
   });
   const col=isPenalty?'#ff6600':isGood?color:'#cc8800';
   const baseCnt=isGood?26:12;
-  const cnt=_isMobileCache?Math.ceil(baseCnt*0.5):baseCnt; // 모바일: 파티클 50% 절감
+  const cnt=_isMobileCache?Math.ceil(baseCnt*0.5):_isTablet()?Math.ceil(baseCnt*0.75):baseCnt;
   const sparks=useMemo(()=>Array.from({length:cnt},(_,i)=>{
     const a=(i/cnt)*Math.PI*2+(Math.random()-0.5)*0.3;
     const spd=isGood?(7+Math.random()*9):(4+Math.random()*5); // 더 빠르고 넓게
@@ -1006,7 +1118,14 @@ function HitEffect({color,hitTime,playStartRef,isGood,isPenalty}){
 // ══════════════════════════════════════
 // SliceEffect - 물리 기반 두동강 이펙트
 // ══════════════════════════════════════
-function SliceEffect({color,edgeCol,startPos,noteType}){
+// SliceEffect geometry 캐싱 (히트마다 생성 방지 → GPU 메모리 누수 제거)
+const _sliceHalfH=PH*0.5;
+const _sliceTopGeo=new THREE.BoxGeometry(PW,_sliceHalfH,PD);
+const _sliceBotGeo=new THREE.BoxGeometry(PW,_sliceHalfH,PD);
+const _sliceLineGeo=new THREE.PlaneGeometry(PW*1.3,0.022);
+function SliceEffect({color,edgeCol,startPos,noteType,hitTime,playStartRef}){
+  // 모바일: useFrame 절감을 위해 생략
+  if(_isMobileCache)return null;
   const topRef=useRef(),botRef=useRef(),lineRef=useRef();
   // 물리 상태: position, velocity, angularVelocity, opacity
   const phys=useRef({
@@ -1057,17 +1176,13 @@ function SliceEffect({color,edgeCol,startPos,noteType}){
   const bodyCol=noteType==='left'?'#3d0f0f':'#0d1a3d';
   return(
     <group>
-      <mesh ref={topRef} position={[0,PH*0.27,0]}>
-        <boxGeometry args={[PW,sliceH,PD]}/>
+      <mesh ref={topRef} position={[0,PH*0.27,0]} geometry={_sliceTopGeo}>
         <meshStandardMaterial color={bodyCol} emissive={color} emissiveIntensity={0.55} transparent opacity={0.9}/>
       </mesh>
-      <mesh ref={botRef} position={[0,-PH*0.27,0]}>
-        <boxGeometry args={[PW,sliceH,PD]}/>
+      <mesh ref={botRef} position={[0,-PH*0.27,0]} geometry={_sliceBotGeo}>
         <meshStandardMaterial color={bodyCol} emissive={color} emissiveIntensity={0.55} transparent opacity={0.9}/>
       </mesh>
-      {/* 절단면 빛줄기 — 얇고 빠르게 사라지는 슬래시 선 */}
-      <mesh ref={lineRef} position={[0,0,PD/2+0.012]}>
-        <planeGeometry args={[PW*1.3,0.022]}/>
+      <mesh ref={lineRef} position={[0,0,PD/2+0.012]} geometry={_sliceLineGeo}>
         <meshBasicMaterial color="white" toneMapped={false} transparent opacity={1}/>
       </mesh>
     </group>
@@ -1079,6 +1194,7 @@ function SliceEffect({color,edgeCol,startPos,noteType}){
 // ══════════════════════════════════════
 const panelGeo=new THREE.BoxGeometry(PW,PH,PD);
 const edgesGeo=new THREE.EdgesGeometry(panelGeo);
+const _noteFaceGeo=new THREE.PlaneGeometry(PW*0.92,PH*0.92); // 캐싱
 
 function NoteComp({data,playStartRef,multRef}){
   const grp=useRef();
@@ -1086,9 +1202,10 @@ function NoteComp({data,playStartRef,multRef}){
   const isHeart=data.noteType==='heart';
   const isCorrect=!isHeart&&data.numVal!==0&&data.numVal%mult===0;
   const noteColor=data.type==='left'?COL.left:COL.right;
-  const edgeCol=noteColor; // 테두리는 항상 노트 색 (빨강/파랑만)
-  const mob=_isMobileCache;
-  const nx=(mob?LANE_X_MB:LANE_X_PC)[data.lineIndex], ny=(mob?LAYER_Y_MB:LAYER_Y_PC)[data.lineLayer];
+  const edgeCol=noteColor;
+  const laneX=_tier==='phone'?LANE_X_MB:_tier==='tablet'?LANE_X_TB:LANE_X_PC;
+  const layerY=_tier==='phone'?LAYER_Y_MB:_tier==='tablet'?LAYER_Y_TB:LAYER_Y_PC;
+  const nx=laneX[data.lineIndex], ny=layerY[data.lineLayer];
   const hitTimeRef=useRef(null);
   const visRef=useRef(true);
 
@@ -1122,15 +1239,17 @@ function NoteComp({data,playStartRef,multRef}){
     return(
       <group ref={grp} position={[nx,ny,0]}>
         <mesh geometry={panelGeo}>
-          <meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6}
-            emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>
+          {_isMobileCache
+            ?<meshBasicMaterial color="#ec4899" transparent opacity={0.55}/>
+            :<meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6}
+                emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>}
         </mesh>
         <Text position={[0,0,PD/2+0.02]} fontSize={PH*0.65} color="#ff6eb4" anchorX="center" anchorY="middle"
-          outlineColor="#ec4899" outlineWidth={0.018}>♥</Text>
+          outlineColor={_isMobileCache?undefined:"#ec4899"} outlineWidth={_isMobileCache?0:0.018}>♥</Text>
         <lineSegments geometry={edgesGeo}>
           <lineBasicMaterial color="#ec4899" toneMapped={false}/>
         </lineSegments>
-        <pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>
+        {!_isMobileCache&&<pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>}
       </group>
     );
   }
@@ -1138,17 +1257,16 @@ function NoteComp({data,playStartRef,multRef}){
   return(
     <group ref={grp} position={[nx,ny,0]}>
       <mesh geometry={panelGeo}>
-        <meshStandardMaterial
-          color={noteColor} roughness={0.05} metalness={0.15}
-          emissive={noteColor} emissiveIntensity={0.22}
-          transparent opacity={0.38}/>
+        {_isMobileCache
+          ?<meshBasicMaterial color={noteColor} transparent opacity={0.55}/>
+          :<meshStandardMaterial color={noteColor} roughness={0.05} metalness={0.15}
+              emissive={noteColor} emissiveIntensity={0.22} transparent opacity={0.38}/>}
       </mesh>
-      <mesh position={[0,0,PD/2+0.002]}>
-        <planeGeometry args={[PW*0.92,PH*0.92]}/>
+      {!_isMobileCache&&<mesh position={[0,0,PD/2+0.002]} geometry={_noteFaceGeo}>
         <meshBasicMaterial color="white" transparent opacity={0.07}/>
-      </mesh>
+      </mesh>}
       <Text position={[0,0,PD/2+0.022]} fontSize={PH*0.52} color="#ffffff" anchorX="center" anchorY="middle"
-          outlineColor={edgeCol} outlineWidth={isCorrect?0.04:0.022}>{data.numVal}</Text>
+          outlineColor={_isMobileCache?undefined:edgeCol} outlineWidth={_isMobileCache?0:isCorrect?0.04:0.022}>{data.numVal}</Text>
       <lineSegments geometry={edgesGeo}>
         <lineBasicMaterial color={edgeCol} toneMapped={false}/>
       </lineSegments>
@@ -1181,36 +1299,27 @@ function ObsComp({data,playStartRef}){
       grpRef.current.position.set(baseX,baseY,cz);
     }
   });
-  const ObsMat=()=><meshStandardMaterial ref={mRef} color={col} emissive={col}
-    emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>;
-  const EdgeMat=()=><meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>;
-  if(data.obstacleType==='top')return(
-    <group ref={grpRef} position={[baseX,baseY,0]}>
-      <mesh geometry={obsGeoH}><ObsMat/></mesh>
-      <lineSegments geometry={obsEdgesH}>
-        <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
-      </lineSegments>
-      <mesh position={[0,-0.52,0.24]} rotation={[0,0,Math.PI]} geometry={obsConeGeo}><EdgeMat/></mesh>
-      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
-    </group>
-  );
-  if(data.obstacleType==='left')return(
-    <group ref={grpRef} position={[baseX,baseY,0]}>
-      <mesh geometry={obsGeoV}><ObsMat/></mesh>
-      <lineSegments geometry={obsEdgesV}>
-        <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
-      </lineSegments>
-      <mesh position={[0.55,0,0.24]} rotation={[0,0,-Math.PI/2]} geometry={obsConeGeo}><EdgeMat/></mesh>
-      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
-    </group>
-  );
+  // 인라인 컴포넌트 금지 — 매 렌더마다 새 타입 생성 → R3F unmount/remount GC 스파이크
+  const isTop=data.obstacleType==='top';
+  const isLeft=data.obstacleType==='left';
+  const geoBody=isTop?obsGeoH:obsGeoV;
+  const geoEdges=isTop?obsEdgesH:obsEdgesV;
+  const conePos=isTop?[0,-0.52,0.24]:isLeft?[0.55,0,0.24]:[-0.55,0,0.24];
+  const coneRot=isTop?[0,0,Math.PI]:isLeft?[0,0,-Math.PI/2]:[0,0,Math.PI/2];
   return(
     <group ref={grpRef} position={[baseX,baseY,0]}>
-      <mesh geometry={obsGeoV}><ObsMat/></mesh>
-      <lineSegments geometry={obsEdgesV}>
+      <mesh geometry={geoBody}>
+        {_isMobileCache
+          ?<meshBasicMaterial color={col} transparent opacity={0.45} depthWrite={false}/>
+          :<meshStandardMaterial ref={mRef} color={col} emissive={col}
+              emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>}
+      </mesh>
+      <lineSegments geometry={geoEdges}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
       </lineSegments>
-      <mesh position={[-0.55,0,0.24]} rotation={[0,0,Math.PI/2]} geometry={obsConeGeo}><EdgeMat/></mesh>
+      <mesh position={conePos} rotation={coneRot} geometry={obsConeGeo}>
+        <meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>
+      </mesh>
       <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
     </group>
   );
@@ -1219,21 +1328,24 @@ function ObsComp({data,playStartRef}){
 // ══════════════════════════════════════
 // WebcamPreview
 // ══════════════════════════════════════
+const _fs=(b,mn=10,mx=999)=>({fontSize:`clamp(${mn}px,${b},${mx}px)`});
 const HCONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
 function WebcamPreview({videoRef,resultsRef,isCameraReady}){
   const cv=useRef();
   useEffect(()=>{
     if(!isCameraReady)return;let af;
-    // 모바일: 15fps로 드로우 (게임 렌더 부하 우선)
-    const TARGET_FPS=_isMobileCache?15:30;
+    const TARGET_FPS=_isMobileCache?15:_isTablet()?20:30;
     const INTERVAL=1000/TARGET_FPS;
     let lastDraw=0;
     const draw=(ts)=>{
       af=requestAnimationFrame(draw);
-      if(ts-lastDraw<INTERVAL)return; // throttle
+      if(ts-lastDraw<INTERVAL)return;
       lastDraw=ts;
       const c=cv.current,v=videoRef.current;
-      if(c&&v&&v.readyState>=2){
+      if(c&&v&&v.readyState>=2&&v.videoWidth>0){
+        // 실제 비디오 비율에 맞게 canvas 버퍼 크기 동적 동기화 (찌그러짐 방지)
+        const vw=v.videoWidth,vh=v.videoHeight;
+        if(c.width!==vw||c.height!==vh){c.width=vw;c.height=vh;}
         const W=c.width,H=c.height,ctx=c.getContext('2d');
         ctx.save();ctx.scale(-1,1);ctx.translate(-W,0);ctx.drawImage(v,0,0,W,H);ctx.restore();
         const res=resultsRef.current;
@@ -1253,24 +1365,33 @@ function WebcamPreview({videoRef,resultsRef,isCameraReady}){
     af=requestAnimationFrame(draw);return()=>cancelAnimationFrame(af);
   },[isCameraReady,videoRef,resultsRef]);
   if(!isCameraReady)return null;
-  const isMob=_isMobileCache;
+  const isPhone=_isMobileCache;
+  const isTab=_isTablet();
   return(
     <div style={{position:'fixed',
-      bottom: isMob?'auto':8,
-      top: isMob?8:'auto',
+      bottom: isPhone?'auto':8,
+      top: isPhone?8:'auto',
       right:8,
-      width: isMob?'clamp(70px,18vw,100px)':'clamp(110px,16vw,190px)',
-      aspectRatio:'4/3',
-      border:'2px solid rgba(59,130,246,.45)',borderRadius:9,overflow:'hidden',zIndex:50,pointerEvents:'none',background:'#000',
-      opacity: isMob?0.75:1}}>
+      width: isPhone?'clamp(60px,15vw,90px)':isTab?'clamp(120px,14vw,160px)':'clamp(110px,16vw,190px)',
+      height: isPhone?'clamp(80px,20vw,120px)':isTab?'clamp(90px,10.5vw,120px)':'clamp(82px,12vw,142px)',
+      border:'2px solid rgba(59,130,246,.45)',borderRadius:9,overflow:'hidden',
+      zIndex:50,pointerEvents:'none',background:'#000',
+      opacity: isPhone?0.72:1}}>
       <div style={{position:'absolute',top:0,left:0,right:0,zIndex:1,background:'rgba(0,0,0,.6)',
         fontSize:8,color:'rgba(147,197,253,.8)',padding:'2px 4px',fontFamily:'monospace',letterSpacing:1}}>CAM</div>
-      <canvas ref={cv} width={isMob?160:320} height={isMob?120:240} style={{display:'block',width:'100%',height:'100%',marginTop:12}}/>
+      <canvas ref={cv} width={320} height={240}
+        style={{display:'block',width:'100%',height:'100%',marginTop:12,objectFit:'cover'}}/>
     </div>
   );
 }
 
-// ── 모듈 레벨 히트 판정 (useFrame 안 함수 생성 방지) ──
+// ── 티어별 레인/레이어 캐시 (useFrame 안에서 재계산 방지) ──
+// _tier 변경은 resize 시에만 발생 → 컴포넌트 레벨이 아닌 모듈 레벨 함수로 캐싱
+function _getLaneX(){return _tier==='phone'?LANE_X_MB:_tier==='tablet'?LANE_X_TB:LANE_X_PC;}
+function _getLayerY(){return _tier==='phone'?LAYER_Y_MB:_tier==='tablet'?LAYER_Y_TB:LAYER_Y_PC;}
+function _getThresholds(){
+  return _tier==='phone'?{top:0.52,side:0.42}:_tier==='tablet'?{top:0.51,side:0.41}:{top:0.50,side:0.40};
+}
 const _POMMEL_OFF=-0.37, _TIP_OFF=2.49, _HIT_R=0.92;
 function bladeHit(hand, nx, ny){
   if(!hand)return false;
@@ -1310,12 +1431,12 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
   useFrame((_,dt)=>{
     if(gameStatus===GS.PLAYING){
       const pulse=Math.pow(1-((ctRef.current%BEAT)/BEAT),4);
-      if(ambRef.current)ambRef.current.intensity=0.1+pulse*0.19;
-      if(spotRef.current)spotRef.current.intensity=0.32+pulse*0.95;
+      if(ambRef.current)ambRef.current.intensity=(_isMobileCache?0.55:0.12)+pulse*(_isMobileCache?0.08:0.19);
+      if(!_isMobileCache&&spotRef.current)spotRef.current.intensity=0.32+pulse*0.95;
     }
     if(shk.current>0&&camRef.current){
       const sh=shk.current;
-      const cy=_isMobileCache?1.5:1.8, cz=_isMobileCache?3.2:4;
+      const cy=camPosRef.current.y, cz=camPosRef.current.z;
       camRef.current.position.set((Math.random()-.5)*sh,cy+(Math.random()-.5)*sh,cz+(Math.random()-.5)*sh);
       shk.current=THREE.MathUtils.lerp(shk.current,0,14*dt);
       if(shk.current<0.01){shk.current=0;camRef.current.position.set(0,cy,cz);}
@@ -1387,8 +1508,9 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       if(cz>MISS_Z){n.missed=true;onNoteMiss(n);anyChange=true;continue;}
       // 히트 판정창 안에 있을 때만 히트 체크
       if(cz>PLAYER_Z-HIT_WIN&&cz<PLAYER_Z+HIT_WIN){
-        const mobO=_isMobileCache; // 캐시값 사용 (매 프레임 window 접근 방지)
-        const nx=(mobO?LANE_X_MB:LANE_X_PC)[n.lineIndex],ny=(mobO?LAYER_Y_MB:LAYER_Y_PC)[n.lineLayer];
+        const laneX2=_getLaneX();
+        const layerY2=_getLayerY();
+        const nx=laneX2[n.lineIndex],ny=layerY2[n.lineLayer];
         const isCorrect=n.noteType==='heart'||(n.numVal!==0&&n.numVal%mult===0);
         let hitHand=null,hitVel=null;
         for(const[hand,side]of[[lHand,'left'],[rHand,'right']]){
@@ -1421,15 +1543,9 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
           // 얼굴 미감지 → 피한 것으로 간주 (페널티 없음)
           o.hit=true; // 통과 처리
         } else {
-          const isMob=_isMobileCache; // 캐시값 사용
-          // top 장애물: 머리 안 숙이면(y가 작으면=화면 위쪽) 맞음
-          // left 장애물: 머리 오른쪽으로 안 피하면(x가 작으면=왼쪽에 있으면) 맞음
-          // right 장애물: 머리 왼쪽으로 안 피하면(x가 크면=오른쪽에 있으면) 맞음
-          // MediaPipe y: 0=위, 1=아래. 머리 숙이면 y가 커짐
-          // top 장애물: head.y < topThresh → 아직 안 숙임 → 맞음
-          //             head.y >= topThresh → 숙인 것 → 피함
-          const topThresh=isMob?0.52:0.50;   // y < 이 값이면 안 숙임 = 맞음
-          const sideThresh=isMob?0.42:0.40;
+          const thresh=_getThresholds();
+          const topThresh=thresh.top;
+          const sideThresh=thresh.side;
           const hit=o.obstacleType==='top'  ? head.y<topThresh
                    :o.obstacleType==='left' ? head.x<(1-sideThresh)
                    :                          head.x>(sideThresh);
@@ -1456,22 +1572,31 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
   const isPlaying=gameStatus===GS.PLAYING;
   const isActive=isPlaying||(gameStatus&&gameStatus!=='LOADING');
   const isMob=_isMobileCache;
+  const camY=isMob?1.5:_isTablet()?1.6:1.8;
+  const camZ=isMob?3.2:_isTablet()?3.6:4.0;
+  const camFov=isMob?78:_isTablet()?70:65;
+  // camY/camZ를 ref에 저장 → useFrame에서 재계산 없이 참조
+  const camPosRef=useRef({y:camY,z:camZ});
+  camPosRef.current.y=camY;
+  camPosRef.current.z=camZ;
   return(
     <>
       <PerspectiveCamera ref={camRef} makeDefault
-        position={[0, isMob?1.5:1.8, isMob?3.2:4]}
-        fov={isMob?78:65}/>
+        position={[0, camY, camZ]}
+        fov={camFov}/>
       {/* 배경/조명/별 - IDLE부터 미리 렌더해서 게임시작 깜박임 방지 */}
       {isActive&&<>
-        <fog   attach="fog"        args={['#05050a',14,50]}/>
-        <ambientLight ref={ambRef} intensity={0.12}/>
-        <spotLight ref={spotRef} position={[0,8,4]} angle={0.65} penumbra={1} intensity={0.62} castShadow={false}/>
-        <Grid position={[0,0,0]} args={[6,80]} cellThickness={0.07} cellColor="#14142a"
-          sectionSize={4} sectionThickness={1.1} sectionColor="#18307a" fadeDistance={46} infiniteGrid/>
-        <mesh rotation={[-Math.PI/2,0,0]} position={[0,-0.01,0]}>
-          <planeGeometry args={[4,80]}/><meshStandardMaterial color="#07070d" roughness={1} metalness={0}/>
-        </mesh>
-        <Stars radius={40} depth={40} count={_isMobileCache?150:350} factor={3} saturation={0} fade speed={0.4}/>
+        <fog attach="fog" args={['#05050a',14,50]}/>
+        <ambientLight ref={ambRef} intensity={_isMobileCache?0.55:0.12}/>
+        {!_isMobileCache&&<spotLight ref={spotRef} position={[0,8,4]} angle={0.65} penumbra={1} intensity={0.62} castShadow={false}/>}
+        {!_isMobileCache&&<>
+          <Grid position={[0,0,0]} args={[6,80]} cellThickness={0.07} cellColor="#14142a"
+            sectionSize={4} sectionThickness={1.1} sectionColor="#18307a" fadeDistance={46} infiniteGrid/>
+          <mesh rotation={[-Math.PI/2,0,0]} position={[0,-0.01,0]}>
+            <planeGeometry args={[4,80]}/><meshStandardMaterial color="#07070d" roughness={1} metalness={0}/>
+          </mesh>
+        </>}
+        <Stars radius={40} depth={40} count={_isMobileCache?100:_isTablet()?250:350} factor={3} saturation={0} fade speed={0.4}/>
       </>}
       {/* 게임 오브젝트 - PLAYING일 때만 */}
       {isPlaying&&<>
@@ -1549,7 +1674,7 @@ function HandButton({label,onActivate,handDataRef,color='#2563eb',icon='▶'}){
       const rect=btn.getBoundingClientRect();
       const hd=handDataRef.current;
       const isMobile=_isMobileCache;
-      const xScale=isMobile?13.0:14.0, yScale=isMobile?8.5:8.0, yOff=isMobile?-1.2:-1.4;
+      const xScale=isMobile?13.0:_isTablet()?13.5:14.0, yScale=isMobile?8.5:_isTablet()?8.2:8.0, yOff=isMobile?-1.2:_isTablet()?-1.3:-1.4;
       const W=window.innerWidth, H=window.innerHeight;
       const PAD=44;
       let hovering=false;
@@ -1614,9 +1739,9 @@ function HandCursor({handDataRef}){
   const containerRef=useRef();
   useEffect(()=>{
     const isMobile=_isMobileCache;
-    const xScale=isMobile?13.0:14.0;
-    const yScale=isMobile?8.5:8.0;
-    const yOff=isMobile?-1.2:-1.4;
+    const xScale=isMobile?13.0:_isTablet()?13.5:14.0;
+    const yScale=isMobile?8.5:_isTablet()?8.2:8.0;
+    const yOff=isMobile?-1.2:_isTablet()?-1.3:-1.4;
     const sides=['left','right'];
     const colors=['rgba(239,68,68,0.85)','rgba(59,130,246,0.85)'];
     const glows=['#ef4444','#3b82f6'];
@@ -1845,20 +1970,21 @@ function App(){
     return()=>clearInterval(iv);
   },[gs]);
 
-  const fs=(b,mn=10,mx=999)=>({fontSize:`clamp(${mn}px,${b},${mx}px)`});
+  const fs=_fs;
   const panel=(ch,ex={})=>(
     <div style={{background:'rgba(4,4,10,.93)',borderRadius:18,border:'2px solid rgba(59,130,246,.2)',
       padding:'clamp(14px,3.5vw,34px) clamp(14px,4vw,36px)',textAlign:'center',
       backdropFilter:'blur(16px)',
-      width: _isMobileCache?'clamp(280px,95vw,400px)':'clamp(300px,90vw,460px)',
-      maxHeight: _isMobileCache?'90vh':'auto',
-      overflowY: _isMobileCache?'auto':'visible',
+      width: _isMobileCache?'clamp(280px,95vw,400px)':_isTablet()?'clamp(320px,72vw,520px)':'clamp(300px,90vw,460px)',
+      maxHeight: _isMobileCache?'90vh':_isTablet()?'92vh':'auto',
+      overflowY: (_isMobileCache||_isTablet())?'auto':'visible',
       ...ex}}>{ch}</div>
   );
 
   return(
-    <div style={{position:'relative',width:'100%',height:'100vh',background:'#000',overflow:'hidden'}}>
-      <video ref={videoRef} style={{position:'absolute',opacity:0,pointerEvents:'none',width:640,height:480}} playsInline muted autoPlay/>
+    <div style={{position:'relative',width:'100%',height:'100vh',background:'#05050a',overflow:'hidden'}}>
+      {/* video: width/height 고정 제거, 실제 스트림 해상도에 맡김 */}
+      <video ref={videoRef} style={{position:'absolute',opacity:0,pointerEvents:'none',width:1,height:1}} playsInline muted autoPlay/>
       {flash&&<div style={{position:'absolute',inset:0,background:'rgba(220,38,38,.48)',zIndex:60,pointerEvents:'none',animation:'dmgflash .32s ease-out forwards'}}/>}
 
       {/* 전체화면 버튼 - 메뉴/결과 화면에서만 표시 */}
@@ -1876,11 +2002,13 @@ function App(){
           </svg>
         </button>
       )}
-      <Canvas frameloop="always"
+      <Canvas className="r3f-canvas" frameloop="always"
         dpr={[1, _isMobileCache ? 1.0 : Math.min(window.devicePixelRatio??1, 1.5)]}
         gl={{antialias:false,powerPreference:'high-performance',
              stencil:false,depth:true,alpha:false}} shadows={false}>
         <color attach="background" args={['#05050a']}/>
+      {/* 모바일: 통합 파티클 풀 드라이버 (useFrame 1개로 전체 파티클 처리) */}
+      {_isMobileCache&&<ParticlePoolDriver/>}
         {/* GameScene 항상 마운트 — unmount/remount 시 검정 깜박임 방지
             gameKey 변경 시에도 key prop 제거하고 gameStatus로만 제어 */}
         <GameScene gameStatus={gs} audioRef={audioRef}
@@ -1959,11 +2087,11 @@ function App(){
           display:'flex',justifyContent:'space-between',alignItems:'flex-start',pointerEvents:'none',zIndex:10}}>
           <div>
             <Hearts count={hearts}/>
-            <div style={{color:'#9ca3af',...fs(_isMobileCache?'2.5vw':'2vw',9,12),marginTop:2}}>라이프</div>
+            <div style={{color:'#9ca3af',...fs(_isMobileCache?'2.5vw':_isTablet()?'1.8vw':'2vw',9,13),marginTop:2}}>라이프</div>
           </div>
           <div style={{textAlign:'center'}}>
             <div style={{fontWeight:700,color:'#fff',lineHeight:1,textShadow:'0 0 10px rgba(59,130,246,.7)',
-              ...(  _isMobileCache ? fs('6.5vw',18,36) : fs('5vw',20,44))}}>{score.toLocaleString()}</div>
+              ...(_isMobileCache?fs('6.5vw',18,36):_isTablet()?fs('4vw',22,44):fs('5vw',20,44))}}>{score.toLocaleString()}</div>
             {combo>0&&(()=>{
               const tier=combo>=50?4:combo>=25?3:combo>=10?2:combo>=5?1:0;
               const colors=['#d1d5db','#60a5fa','#fbbf24','#f97316','#a855f7'];
@@ -1995,8 +2123,8 @@ function App(){
               <div style={{lineHeight:1,display:'flex',alignItems:'baseline',justifyContent:'center',gap:'0.15em'}}>
                 <span style={{color:'#fbbf24',fontWeight:900,
                   textShadow:'0 0 18px rgba(251,191,36,0.7)',
-                  ...(_isMobileCache ? fs('9vw',28,44) : fs('7vw',30,52))}}>{mult}</span>
-                <span style={{color:'rgba(251,191,36,0.7)',fontWeight:700,...(_isMobileCache?fs('3.5vw',12,18):fs('3vw',13,20))}}>의 배수</span>
+                  ...(_isMobileCache?fs('9vw',28,44):_isTablet()?fs('6vw',28,48):fs('7vw',30,52))}}>{mult}</span>
+                <span style={{color:'rgba(251,191,36,0.7)',fontWeight:700,...(_isMobileCache?fs('3.5vw',12,18):_isTablet()?fs('2.5vw',12,18):fs('3vw',13,20))}}>의 배수</span>
               </div>
             </div>
           </div>
