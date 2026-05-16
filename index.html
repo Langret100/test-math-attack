@@ -102,14 +102,17 @@ const WALL_TIME_LIMIT=5; // 5초 안에 못 부수면 하트 감소
 // ══════════════════════════════════════
 const _particlePool=[];
 
-// 파티클 등록 (컴포넌트 마운트 시 호출)
 function _regParticle(mesh, life, updateFn){
   mesh.userData._pLife=life;
-  mesh.userData._pT=-1; // -1=대기
+  mesh.userData._pT=-1;
   mesh.userData._pUpdate=updateFn;
   _particlePool.push(mesh);
 }
-// 파티클 시작 (히트 시 호출)
+function _unregParticle(mesh){
+  if(!mesh)return;
+  const idx=_particlePool.indexOf(mesh);
+  if(idx!==-1)_particlePool.splice(idx,1);
+}
 function _startParticle(mesh){
   if(mesh){mesh.userData._pT=0;mesh.visible=true;}
 }
@@ -169,21 +172,21 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
   const timerRef=useRef(0); // 경과 시간
   const sparks=useRef([]);
   const sparkMeshes=useRef([]);
-  const SPARK_POOL=_isMobileCache?12:_isTablet()?18:24;
+  const SPARK_POOL=24;
 
   // 균열/벽돌 위치 고정 (useMemo로 한번만 계산)
-  const crackSeeds=useMemo(()=>Array.from({length:_isMobileCache?8:_isTablet()?11:14},(_,i)=>({
+  const crackSeeds=useMemo(()=>Array.from({length:14},(_,i)=>({
     x:(Math.random()-0.5)*4.2, y:(Math.random()-0.5)*2.8,
     len:0.3+Math.random()*0.9, angle:Math.random()*Math.PI,
   })),[]);
   const brickPositions=useMemo(()=>{
     const arr=[];
-    const rows=_isMobileCache?3:_isTablet()?4:5, cols=_isMobileCache?3:_isTablet()?3:4;
+    const rows=5, cols=4;
     for(let row=0;row<rows;row++)for(let col=0;col<cols;col++)
       arr.push([col*1.3-1.95, row*0.64-1.28]);
     return arr;
   },[]);
-  const debrisData=useMemo(()=>Array.from({length:_isMobileCache?14:_isTablet()?22:30},(_,i)=>({
+  const debrisData=useMemo(()=>Array.from({length:30},(_,i)=>({
     dx:(Math.random()-0.5)*3, dy:0.5+Math.random()*2,
     speed:3+Math.random()*6, size:0.12+Math.random()*0.22,
     life:0.6+Math.random()*0.5,
@@ -312,10 +315,8 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
     <group ref={grp} position={[0,1.5,WALL_SPAWN_Z]}>
       {/* 벽 본체 */}
       <mesh geometry={_wallBodyGeo}>
-        {_isMobileCache
-          ?<meshBasicMaterial color='#1a0808' transparent opacity={0.92}/>
-          :<meshStandardMaterial color='#0d0d0d' roughness={0.9} metalness={0.05}
-              emissive='#1a0a0a' emissiveIntensity={0.4}/>}
+        <meshStandardMaterial color='#0d0d0d' roughness={0.9} metalness={0.05}
+              emissive='#1a0a0a' emissiveIntensity={0.4}/>
       </mesh>
       {/* 벽돌 패턴 (edges 캐싱) */}
       {brickPositions.map(([bx,by],i)=>(
@@ -343,7 +344,7 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
       <mesh position={[0,1.9,0.15]} geometry={_wallHPBgGeo}>
         <meshBasicMaterial color='#111' toneMapped={false} transparent opacity={0.7}/>
       </mesh>
-      {!_isMobileCache&&<pointLight color='#ff3300' intensity={5} distance={7} decay={2}/>}
+      <pointLight color='#ff3300' intensity={5} distance={7} decay={2}/>
       {/* 불꽃 파티클 풀 */}
       {Array.from({length:SPARK_POOL},(_,i)=>(
         <mesh key={`sp${i}`} ref={el=>sparkMeshes.current[i]=el} visible={false}>
@@ -605,9 +606,9 @@ function useMediaPipe(videoRef){
         const isTouchDev=_isTouchDevice();
         const stream=await navigator.mediaDevices.getUserMedia({video:{
           facingMode:'user',
-          width:{ideal:isMob?320:isTouchDev?480:640},
-          height:{ideal:isMob?240:isTouchDev?360:480},
-          frameRate:{ideal:isMob?30:isTouchDev?30:60}
+          width:{ideal:isMob?480:isTouchDev?640:1280},
+          height:{ideal:isMob?360:isTouchDev?480:720},
+          frameRate:{ideal:60}
         }});
         if(videoRef.current&&active){
           videoRef.current.srcObject=stream;
@@ -625,7 +626,7 @@ function useMediaPipe(videoRef){
               }catch(e){}
               setReady(true);
               fdLoop(); // 얼굴 감지 별도 루프 시작
-              loop();   // 손 감지 루프 시작
+              scheduleLoop(); // 손 감지 루프 시작
             },200);
           };
         }
@@ -656,11 +657,20 @@ function useMediaPipe(videoRef){
           }
         }catch(e){}
       }
-      fdTimer=setTimeout(fdLoop, _isMobileCache?125:_isTablet()?110:100);
+      fdTimer=setTimeout(fdLoop, 100);
     }
 
-    // 손 감지: 모바일 33ms(~30fps), PC 0ms(최대속도)
-    function loop(){
+    // 손 감지: MessageChannel로 렌더 커밋 직후 유휴 슬롯에서 실행
+    // Three.js rAF(paint) 후 → 다음 프레임 전 사이 공백에 추론 → 렌더 블로킹 없음
+    const mc=new MessageChannel();
+    let loopPending=false;
+    function scheduleLoop(){
+      if(loopPending||!active)return;
+      loopPending=true;
+      mc.port2.postMessage(null);
+    }
+    mc.port1.onmessage=()=>{
+      loopPending=false;
       if(!videoRef.current||!hlRef.current||!active)return;
       const v=videoRef.current;
       if(v.videoWidth>0&&v.readyState>=2){
@@ -668,10 +678,8 @@ function useMediaPipe(videoRef){
         try{const hr=hlRef.current.detectForVideo(v,hlTs);lrRef.current=hr;processHands(hr);}
         catch(e){hlTs+=2;}
       }
-      rafRef.current=_isTouchDevice()
-        ? setTimeout(loop,33)
-        : setTimeout(loop,0);
-    }
+      rafRef.current=requestAnimationFrame(scheduleLoop);
+    };
 
     function processHands(hr){
       // ── MediaPipe 콜백: raw 목표값만 저장, 보간은 useFrame에서 ──
@@ -736,7 +744,8 @@ function useMediaPipe(videoRef){
     setup();
     return()=>{
       active=false;
-      clearTimeout(rafRef.current);clearTimeout(fdTimer);cancelAnimationFrame(rafRef.current);
+      mc.port1.onmessage=null;
+      cancelAnimationFrame(rafRef.current);clearTimeout(fdTimer);
       hlRef.current?.close();fdRef.current?.close();
       if(videoRef.current?.srcObject)videoRef.current.srcObject.getTracks().forEach(t=>t.stop());
     };
@@ -802,7 +811,7 @@ function Saber({type,handDataRef}){
       prevPos.current.copy(sPos.current);
       const spd=data.vel.length();
       swingAcc.current=THREE.MathUtils.lerp(swingAcc.current,Math.min(spd*0.07,1),0.35);
-      // glowRef/coreRef: PC는 meshStandardMaterial(emissiveIntensity 있음), 모바일은 meshBasicMaterial
+      // glowRef/coreRef: meshStandardMaterial (emissiveIntensity 있음)
       const glow=2.8+swingAcc.current*16;
       if(glowRef.current?.material?.emissiveIntensity!==undefined)glowRef.current.material.emissiveIntensity=glow;
       if(coreRef.current?.material?.emissiveIntensity!==undefined)coreRef.current.material.emissiveIntensity=glow*0.6;
@@ -823,22 +832,7 @@ function Saber({type,handDataRef}){
   });
 
   // 손잡이 상세 구성: 하단 손잡이 + 가드 + 블레이드
-  if(_isMobileCache){
-    // 모바일: mesh 2개로 단순화 (손잡이 1 + 블레이드 글로우 1)
-    return(
-      <group ref={grp}>
-        <mesh position={[0,-0.18,0]}>
-          <cylinderGeometry args={[0.035,0.030,0.36,6]}/>
-          <meshBasicMaterial color="#222"/>
-        </mesh>
-        <mesh ref={glowRef} position={[0,0.09+L/2,0]}>
-          <capsuleGeometry args={[0.044,L,6,8]}/>
-          <meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
-        </mesh>
-        <pointLight color={col} intensity={5} distance={6} decay={2} position={[0,1.2,0]}/>
-      </group>
-    );
-  }
+
   return(
     <group ref={grp}>
       {/* ── 손잡이 (하단) ── */}
@@ -884,7 +878,7 @@ function Saber({type,handDataRef}){
         <meshStandardMaterial color="white" emissive={col} emissiveIntensity={1.8} toneMapped={false} transparent opacity={0.75}/>
       </mesh>
       <pointLight color={col} intensity={6} distance={7} decay={2} position={[0,1.4,0]}/>
-      {!_isMobileCache&&<pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>}
+      <pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>
     </group>
   );
 }
@@ -908,7 +902,7 @@ const BAD_DIRS=(()=>{
 function Particle({dx,dy,speed,size,color,life,gravity=true,spin=0,delay=0}){
   const r=useRef();
   useEffect(()=>{
-    if(!_isMobileCache||!r.current)return;
+    if(!r.current)return;
     _regParticle(r.current, life+delay, (m,t,dt,f)=>{
       const rt=t-delay; if(rt<0){m.visible=false;return;}
       const rf=rt/life;
@@ -919,25 +913,14 @@ function Particle({dx,dy,speed,size,color,life,gravity=true,spin=0,delay=0}){
       m.visible=true;
     });
     _startParticle(r.current);
+    return()=>_unregParticle(r.current);
   },[]);
-  useFrame(_isMobileCache?()=>{}:(_,dt)=>{
-    if(!r.current)return;
-    const t=r.current.userData.t=(r.current.userData.t??-delay)+dt;
-    if(t<0){r.current.visible=false;return;}
-    if(t>life){r.current.visible=false;return;}
-    r.current.visible=true;
-    const f=t/life;
-    const grav=gravity?-6*t*t:0;
-    r.current.position.set(dx*speed*t,dy*speed*t+grav,spin?Math.sin(t*8+spin)*0.3:0);
-    r.current.scale.setScalar(Math.max(0.01,(1-f*f)*1.2));
-    if(r.current.material)r.current.material.opacity=Math.max(0,1-f*1.4);
-  });
-  return(<mesh ref={r}><sphereGeometry args={[size,_isMobileCache?3:5,_isMobileCache?3:5]}/><meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/></mesh>);
+  useFrame(()=>{});
+  return(<mesh ref={r}><sphereGeometry args={[size,5,5]}/><meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/></mesh>);
 }
 
 // 별 모양 스파크 — 모바일에서 렌더 생략
 function StarSpark({angle,speed,color,life,size=0.09}){
-  if(_isMobileCache)return null;
   const r=useRef();
   const ax=Math.cos(angle),ay=Math.sin(angle);
   useFrame((_,dt)=>{
@@ -963,7 +946,6 @@ function StarSpark({angle,speed,color,life,size=0.09}){
 
 // 팽창 링 — 모바일에서 렌더 생략
 function ExpandRing({color,speed,maxR,life,axis='z'}){
-  if(_isMobileCache)return null;
   const r=useRef();
   useFrame((_,dt)=>{
     if(!r.current)return;
@@ -989,7 +971,6 @@ const _sparkGeo=new THREE.PlaneGeometry(1,1);
 
 // tsh를 자체 계산하는 단순 구체 메시 — 모바일 생략
 function TshMesh({color,opacity0,scale0,life,hitTime,playStartRef,back=false}){
-  if(_isMobileCache)return null;
   const r=useRef();
   useFrame(()=>{
     if(!r.current)return;
@@ -1007,7 +988,6 @@ function TshMesh({color,opacity0,scale0,life,hitTime,playStartRef,back=false}){
 }
 // 빛줄기 컴포넌트 — 모바일 생략
 function GlowRay({rot,color,hitTime,playStartRef}){
-  if(_isMobileCache)return null;
   const r=useRef();
   useFrame(()=>{
     if(!r.current)return;
@@ -1027,13 +1007,12 @@ function GlowRay({rot,color,hitTime,playStartRef}){
 // 불꽃 스파크 이펙트
 function Spark({dx,dy,speed,color,life,delay=0}){
   const r=useRef();
-  // PC: 기존 개별 useFrame / 모바일: 풀 등록
   useEffect(()=>{
-    if(!_isMobileCache||!r.current)return;
+    if(!r.current)return;
     _regParticle(r.current, life+delay, (m,t,dt,f)=>{
       const rt=t-delay;
       if(rt<0){m.visible=false;return;}
-      const rf=rt/(life);
+      const rf=rt/life;
       const ease=Math.pow(Math.max(0,1-rf),0.4);
       const grav=-8*rt*rt;
       m.position.set(dx*speed*ease*rt, dy*speed*ease*rt+grav, (Math.random()-0.5)*0.05);
@@ -1045,23 +1024,9 @@ function Spark({dx,dy,speed,color,life,delay=0}){
       m.visible=true;
     });
     _startParticle(r.current);
+    return()=>_unregParticle(r.current);
   },[]);
-  useFrame(_isMobileCache?()=>{}:(_,dt)=>{
-    if(!r.current)return;
-    const t=(r.current.userData.t=(r.current.userData.t??-delay)+dt);
-    if(t<0){r.current.visible=false;return;}
-    if(t>life){r.current.visible=false;return;}
-    r.current.visible=true;
-    const f=t/life;
-    const ease=Math.pow(1-f,0.4);
-    const grav=-8*t*t;
-    r.current.position.set(dx*speed*ease*t, dy*speed*ease*t+grav, (Math.random()-0.5)*0.05);
-    r.current.rotation.z=Math.atan2(dy,dx)+Math.PI/2;
-    const w=Math.max(0.001,0.012*(1-f*f));
-    const h=Math.max(0.001,(0.08+0.12*ease)*(1-f*1.2));
-    r.current.scale.set(w,h,1);
-    if(r.current.material)r.current.material.opacity=Math.max(0,1-f*f*1.6);
-  });
+  useFrame(()=>{});
   return(<mesh ref={r} geometry={_sparkGeo}><meshBasicMaterial color={color} toneMapped={false} transparent opacity={1}/></mesh>);
 }
 
@@ -1095,7 +1060,7 @@ function HitEffect({color,hitTime,playStartRef,isGood,isPenalty}){
   });
   const col=isPenalty?'#ff6600':isGood?color:'#cc8800';
   const baseCnt=isGood?26:12;
-  const cnt=_isMobileCache?Math.ceil(baseCnt*0.5):_isTablet()?Math.ceil(baseCnt*0.75):baseCnt;
+  const cnt=baseCnt;
   const sparks=useMemo(()=>Array.from({length:cnt},(_,i)=>{
     const a=(i/cnt)*Math.PI*2+(Math.random()-0.5)*0.3;
     const spd=isGood?(7+Math.random()*9):(4+Math.random()*5); // 더 빠르고 넓게
@@ -1122,8 +1087,6 @@ const _sliceTopGeo=new THREE.BoxGeometry(PW,_sliceHalfH,PD);
 const _sliceBotGeo=new THREE.BoxGeometry(PW,_sliceHalfH,PD);
 const _sliceLineGeo=new THREE.PlaneGeometry(PW*1.3,0.022);
 function SliceEffect({color,edgeCol,startPos,noteType,hitTime,playStartRef}){
-  // 모바일: useFrame 절감을 위해 생략
-  if(_isMobileCache)return null;
   const topRef=useRef(),botRef=useRef(),lineRef=useRef();
   // 물리 상태: position, velocity, angularVelocity, opacity
   const phys=useRef({
@@ -1237,17 +1200,15 @@ function NoteComp({data,playStartRef,multRef}){
     return(
       <group ref={grp} position={[nx,ny,0]}>
         <mesh geometry={panelGeo}>
-          {_isMobileCache
-            ?<meshBasicMaterial color="#ec4899" transparent opacity={0.55}/>
-            :<meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6}
-                emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>}
+          <meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6}
+                emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>
         </mesh>
         <Text position={[0,0,PD/2+0.02]} fontSize={PH*0.65} color="#ff6eb4" anchorX="center" anchorY="middle"
-          outlineColor={_isMobileCache?undefined:"#ec4899"} outlineWidth={_isMobileCache?0:0.018}>♥</Text>
+          outlineColor="#ec4899" outlineWidth={0.018}>♥</Text>
         <lineSegments geometry={edgesGeo}>
           <lineBasicMaterial color="#ec4899" toneMapped={false}/>
         </lineSegments>
-        {!_isMobileCache&&<pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>}
+        <pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>
       </group>
     );
   }
@@ -1255,20 +1216,18 @@ function NoteComp({data,playStartRef,multRef}){
   return(
     <group ref={grp} position={[nx,ny,0]}>
       <mesh geometry={panelGeo}>
-        {_isMobileCache
-          ?<meshBasicMaterial color={noteColor} transparent opacity={0.55}/>
-          :<meshStandardMaterial color={noteColor} roughness={0.05} metalness={0.15}
-              emissive={noteColor} emissiveIntensity={0.22} transparent opacity={0.38}/>}
+        <meshStandardMaterial color={noteColor} roughness={0.05} metalness={0.15}
+              emissive={noteColor} emissiveIntensity={0.22} transparent opacity={0.38}/>
       </mesh>
-      {!_isMobileCache&&<mesh position={[0,0,PD/2+0.002]} geometry={_noteFaceGeo}>
+      <mesh position={[0,0,PD/2+0.002]} geometry={_noteFaceGeo}>
         <meshBasicMaterial color="white" transparent opacity={0.07}/>
-      </mesh>}
+      </mesh>
       <Text position={[0,0,PD/2+0.022]} fontSize={PH*0.52} color="#ffffff" anchorX="center" anchorY="middle"
-          outlineColor={_isMobileCache?undefined:edgeCol} outlineWidth={_isMobileCache?0:isCorrect?0.04:0.022}>{data.numVal}</Text>
+          outlineColor={edgeCol} outlineWidth={isCorrect?0.04:0.022}>{data.numVal}</Text>
       <lineSegments geometry={edgesGeo}>
         <lineBasicMaterial color={edgeCol} toneMapped={false}/>
       </lineSegments>
-      {isCorrect&&!_isMobileCache&&<pointLight color={COL.correct} intensity={0.9} distance={2.2} decay={2}/>}
+      {isCorrect&&<pointLight color={COL.correct} intensity={0.9} distance={2.2} decay={2}/>}
     </group>
   );
 }
@@ -1291,7 +1250,7 @@ function ObsComp({data,playStartRef}){
   const baseY=data.obstacleType==='top'?3.1:1.7;
   useFrame((s)=>{
     // emissiveIntensity는 PC(meshStandardMaterial)에만 존재
-    if(!_isMobileCache&&mRef.current)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;
+    if(mRef.current)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;
     if(grpRef.current){
       const time=(performance.now()-playStartRef.current)/1000;
       const cz=PLAYER_Z-(data.time-time)*NOTE_SPEED;
@@ -1308,10 +1267,8 @@ function ObsComp({data,playStartRef}){
   return(
     <group ref={grpRef} position={[baseX,baseY,0]}>
       <mesh geometry={geoBody}>
-        {_isMobileCache
-          ?<meshBasicMaterial color={col} transparent opacity={0.45} depthWrite={false}/>
-          :<meshStandardMaterial ref={mRef} color={col} emissive={col}
-              emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>}
+        <meshStandardMaterial ref={mRef} color={col} emissive={col}
+              emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>
       </mesh>
       <lineSegments geometry={geoEdges}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
@@ -1319,7 +1276,7 @@ function ObsComp({data,playStartRef}){
       <mesh position={conePos} rotation={coneRot} geometry={obsConeGeo}>
         <meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>
       </mesh>
-      {!_isMobileCache&&<pointLight color={col} intensity={2.2} distance={5} decay={2}/>}
+      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
     </group>
   );
 }
@@ -1333,7 +1290,7 @@ function WebcamPreview({videoRef,resultsRef,isCameraReady}){
   const cv=useRef();
   useEffect(()=>{
     if(!isCameraReady)return;let af;
-    const TARGET_FPS=_isMobileCache?15:_isTablet()?20:30;
+    const TARGET_FPS=30;
     const INTERVAL=1000/TARGET_FPS;
     let lastDraw=0;
     const draw=(ts)=>{
@@ -1342,9 +1299,9 @@ function WebcamPreview({videoRef,resultsRef,isCameraReady}){
       lastDraw=ts;
       const c=cv.current,v=videoRef.current;
       if(c&&v&&v.readyState>=2&&v.videoWidth>0){
-        // 실제 비디오 비율에 맞게 canvas 버퍼 크기 동적 동기화 (찌그러짐 방지)
-        const vw=v.videoWidth,vh=v.videoHeight;
-        if(c.width!==vw||c.height!==vh){c.width=vw;c.height=vh;}
+        // 프리뷰 버퍼는 320x240 고정: drawImage 비용은 대상 버퍼 크기에 비례
+        // 실제 스트림이 480x360이어도 미리보기 표시 목적이므로 축소 드로우
+        if(c.width!==320||c.height!==240){c.width=320;c.height=240;}
         const W=c.width,H=c.height,ctx=c.getContext('2d');
         ctx.save();ctx.scale(-1,1);ctx.translate(-W,0);ctx.drawImage(v,0,0,W,H);ctx.restore();
         const res=resultsRef.current;
@@ -1430,8 +1387,8 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
   useFrame((_,dt)=>{
     if(gameStatus===GS.PLAYING){
       const pulse=Math.pow(1-((ctRef.current%BEAT)/BEAT),4);
-      if(ambRef.current)ambRef.current.intensity=(_isMobileCache?0.55:0.12)+pulse*(_isMobileCache?0.08:0.19);
-      if(!_isMobileCache&&spotRef.current)spotRef.current.intensity=0.32+pulse*0.95;
+      if(ambRef.current)ambRef.current.intensity=0.12+pulse*0.19;
+      if(spotRef.current)spotRef.current.intensity=0.32+pulse*0.95;
     }
     if(shk.current>0&&camRef.current){
       const sh=shk.current;
@@ -1586,16 +1543,16 @@ function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
       {/* 배경/조명/별 - IDLE부터 미리 렌더해서 게임시작 깜박임 방지 */}
       {isActive&&<>
         <fog attach="fog" args={['#05050a',14,50]}/>
-        <ambientLight ref={ambRef} intensity={_isMobileCache?0.55:0.12}/>
-        {!_isMobileCache&&<spotLight ref={spotRef} position={[0,8,4]} angle={0.65} penumbra={1} intensity={0.62} castShadow={false}/>}
-        {!_isMobileCache&&<>
+        <ambientLight ref={ambRef} intensity={0.12}/>
+        <spotLight ref={spotRef} position={[0,8,4]} angle={0.65} penumbra={1} intensity={0.62} castShadow={false}/>
+        <>
           <Grid position={[0,0,0]} args={[6,80]} cellThickness={0.07} cellColor="#14142a"
             sectionSize={4} sectionThickness={1.1} sectionColor="#18307a" fadeDistance={46} infiniteGrid/>
           <mesh rotation={[-Math.PI/2,0,0]} position={[0,-0.01,0]}>
             <planeGeometry args={[4,80]}/><meshStandardMaterial color="#07070d" roughness={1} metalness={0}/>
           </mesh>
-        </>}
-        <Stars radius={40} depth={40} count={_isMobileCache?100:_isTablet()?250:350} factor={3} saturation={0} fade speed={0.4}/>
+        </>
+        <Stars radius={40} depth={40} count={350} factor={3} saturation={0} fade speed={0.4}/>
       </>}
       {/* 게임 오브젝트 - PLAYING일 때만 */}
       {isPlaying&&<>
@@ -1815,10 +1772,16 @@ function App(){
   const{isCameraReady,handDataRef,headPositionRef,lastResultsRef,error:camErr}=useMediaPipe(videoRef);
   useEffect(()=>{comboRef.current=combo;},[combo]);
 
-  const showMsg=useCallback((text,color)=>{setHitMsg({text,color});setTimeout(()=>setHitMsg(null),1050);},[]);
+  // 타이머 추적: 게임 종료/재시작 시 고아 타이머 전부 제거
+  const _timers=useRef([]);
+  const _safeTO=(fn,ms)=>{const id=setTimeout(fn,ms);_timers.current.push(id);return id;};
+  const _clearTimers=()=>{_timers.current.forEach(clearTimeout);_timers.current=[];};
+  useEffect(()=>()=>_clearTimers(),[]);
+
+  const showMsg=useCallback((text,color)=>{setHitMsg({text,color});_safeTO(()=>setHitMsg(null),1050);},[]);
   const doDamage=useCallback(()=>{
-    setFlash(true);setTimeout(()=>setFlash(false),320);playDamage();
-    setHearts(h=>{if(h<=1){setTimeout(()=>{setGs(GS.GAME_OVER);audioRef.current?.pause();},80);return 0;}return h-1;});
+    setFlash(true);_safeTO(()=>setFlash(false),320);playDamage();
+    setHearts(h=>{if(h<=1){_safeTO(()=>{setGs(GS.GAME_OVER);audioRef.current?.pause();},80);return 0;}return h-1;});
   },[]);
 
   // onNoteHit(note, isCorrect, colorMatch, fastEnough, isPenalty)
@@ -1869,7 +1832,7 @@ function App(){
     wallRef.current.state='breaking'; // 즉시 히트판정/타이머 중단
     setWallUI({hits:WALL_HITS_NEEDED,breaking:true});
     setWallBreaking(true);
-    setTimeout(()=>{
+    _safeTO(()=>{
       const t=(performance.now()-playStartRef.current)/1000;
       const TRAVEL=Math.abs(SPAWN_Z-PLAYER_Z)/NOTE_SPEED;
       const resumeT=t+TRAVEL+0.5; // 파괴 후 TRAVEL+1.5초 뒤부터 노트 생성
@@ -1918,8 +1881,8 @@ function App(){
       chartRef.current.obstacles=chartRef.current.obstacles.filter(o=>o.hit);
       setWallWarning(true);
       playWarningSiren();
-      setTimeout(()=>setWallWarning(false),1800);
-      setTimeout(()=>{
+      _safeTO(()=>setWallWarning(false),1800);
+      _safeTO(()=>{
         if(wallRef.current.state==='idle'){
           wallRef.current={state:'stopped',startTime:performance.now(),resetProg:Date.now()}; // 타이머+진행도 리셋
           wallHitCountRef.current=0;
@@ -1938,6 +1901,7 @@ function App(){
 
   const startGame=useCallback(()=>{
     if(!isCameraReady)return;
+    _clearTimers();
     try{if(_actx&&_actx.state==='suspended')_actx.resume().catch(()=>{});}catch(e){}
     const m=MULT_OPTS[Math.floor(Math.random()*MULT_OPTS.length)];
     multRef.current=m;setMult(m);
@@ -2001,12 +1965,12 @@ function App(){
         </button>
       )}
       <Canvas className="r3f-canvas" frameloop="always"
-        dpr={[1, _isMobileCache ? 1.0 : Math.min(window.devicePixelRatio??1, 1.5)]}
+        dpr={[1, Math.min(window.devicePixelRatio??1, 1.5)]}
         gl={{antialias:false,powerPreference:'high-performance',
              stencil:false,depth:true,alpha:false}} shadows={false}>
         <color attach="background" args={['#05050a']}/>
       {/* 모바일: 통합 파티클 풀 드라이버 (useFrame 1개로 전체 파티클 처리) */}
-      {_isMobileCache&&<ParticlePoolDriver/>}
+      <ParticlePoolDriver/>
         {/* GameScene 항상 마운트 — unmount/remount 시 검정 깜박임 방지
             gameKey 변경 시에도 key prop 제거하고 gameStatus로만 제어 */}
         <GameScene gameStatus={gs} audioRef={audioRef}
