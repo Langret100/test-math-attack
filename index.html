@@ -625,20 +625,33 @@ function useMediaPipe(videoRef){
                 }
               }catch(e){}
               setReady(true);
-              fdLoop(); // 얼굴 감지 별도 루프 시작
-              scheduleLoop(); // 손 감지 루프 시작
+              scheduleLoop(); // 손+얼굴 추론 루프 시작
             },200);
           };
         }
       }catch(e){console.error(e);setErr(e.message);}
     }
 
-    // 얼굴 감지: 완전 별도 타이머 (모바일 8fps=125ms, PC 10fps=100ms)
-    // → 손+얼굴 동기 detectForVideo 이중 호출로 인한 프레임 스파이크 제거
-    function fdLoop(){
-      if(!active||!fdRef.current||!videoRef.current)return;
+    // ── 손 감지 루프: setTimeout(0) 기반 ─────────────────────────────────────
+    // setTimeout(0)은 현재 콜스택(rAF paint 포함)이 완료된 뒤 실행됨
+    // → 렌더를 블로킹하지 않으면서 최대한 빠르게 추론
+    // → 결과는 handDataRef에 저장, Saber useFrame이 매 프레임 보간해서 60fps 움직임 구현
+    function hlLoop(){
+      if(!active)return;
       const v=videoRef.current;
-      if(v.videoWidth>0&&v.readyState>=2){
+      if(v&&v.videoWidth>0&&v.readyState>=2&&hlRef.current){
+        hlTs=Math.max(hlTs+1,Math.floor(performance.now()));
+        try{const hr=hlRef.current.detectForVideo(v,hlTs);lrRef.current=hr;processHands(hr);}
+        catch(e){hlTs+=2;}
+      }
+      rafRef.current=setTimeout(hlLoop,0);
+    }
+
+    // 얼굴 감지: 100ms마다 (장애물 회피용, 10Hz로 충분)
+    function fdLoop(){
+      if(!active)return;
+      const v=videoRef.current;
+      if(v&&v.videoWidth>0&&v.readyState>=2&&fdRef.current){
         try{
           const fdNow=Math.floor(performance.now());
           if(fdNow>fdTs){
@@ -647,49 +660,31 @@ function useMediaPipe(videoRef){
             if(fr.detections?.length>0){
               const bb=fr.detections[0].boundingBox;
               const W=v.videoWidth,H=v.videoHeight;
-              const cx=(bb.originX+bb.width*0.5)/W;
-              const cy=(bb.originY+bb.height*0.5)/H;
-              const bh=bb.height/H;
-              headRef.current={x:1-cx,y:cy,h:bh,detected:true};
+              headRef.current={
+                x:1-((bb.originX+bb.width*0.5)/W),
+                y:(bb.originY+bb.height*0.5)/H,
+                h:bb.height/H,detected:true};
             }else{
               headRef.current={...headRef.current,detected:false};
             }
           }
         }catch(e){}
       }
-      fdTimer=setTimeout(fdLoop, 100);
+      fdTimer=setTimeout(fdLoop,100);
     }
 
-    // 손 감지: MessageChannel로 렌더 커밋 직후 유휴 슬롯에서 실행
-    // Three.js rAF(paint) 후 → 다음 프레임 전 사이 공백에 추론 → 렌더 블로킹 없음
-    const mc=new MessageChannel();
-    let loopPending=false;
-    function scheduleLoop(){
-      if(loopPending||!active)return;
-      loopPending=true;
-      mc.port2.postMessage(null);
-    }
-    mc.port1.onmessage=()=>{
-      loopPending=false;
-      if(!videoRef.current||!hlRef.current||!active)return;
-      const v=videoRef.current;
-      if(v.videoWidth>0&&v.readyState>=2){
-        hlTs=Math.max(hlTs+1,Math.floor(performance.now()));
-        try{const hr=hlRef.current.detectForVideo(v,hlTs);lrRef.current=hr;processHands(hr);}
-        catch(e){hlTs+=2;}
-      }
-      rafRef.current=requestAnimationFrame(scheduleLoop);
-    };
+    function scheduleLoop(){ hlLoop(); fdLoop(); }
 
     function processHands(hr){
       // ── MediaPipe 콜백: raw 목표값만 저장, 보간은 useFrame에서 ──
       const now=performance.now();
       const s=handDataRef.current;
       s.lastTs=now;
-      const isMobile=_isMobileCache;
-      const xScale=isMobile?9.0:_isTablet()?11.0:14.0;
-      const yScale=isMobile?6.5:_isTablet()?7.0:8.0;
-      const yOff=isMobile?-0.8:_isTablet()?-1.0:-1.4;
+      // 좌표 스케일: 화면 비율에 무관하게 3D 레인 범위(±1.5)에 손이 닿도록 통일
+      // 티어별 카메라 FOV/거리가 다르므로 약간의 차이는 유지
+      const xScale=_tier==='phone'?10.5:_tier==='tablet'?12.0:14.0;
+      const yScale=_tier==='phone'?7.0:_tier==='tablet'?7.5:8.0;
+      const yOff=_tier==='phone'?-1.0:_tier==='tablet'?-1.2:-1.4;
 
       let gotL=false,gotR=false;
       // 같은 side 중복 감지 시 신뢰도 높은 것만 채택 (좌우 꼬임 방지)
@@ -729,23 +724,28 @@ function useMediaPipe(videoRef){
         s[side].graceCount=0;
         if(side==='right')gotR=true;else gotL=true;
       }
-      // grace: 천천히 휘둘러도 끊기지 않게 (30fps 기준 ~0.5초)
-      const GRACE_MAX=15;
+      // grace: 추론 간격 기반 시간으로 판단 (~0.6초 이상 미감지 시 손 제거)
+      const GRACE_SEC=0.6;
       for(const side of['left','right']){
         if(side==='left'&&gotL)continue;
         if(side==='right'&&gotR)continue;
         if(s[side]){
-          s[side].graceCount=(s[side].graceCount??0)+1;
-          if(s[side].graceCount>GRACE_MAX)s[side]=null;
+          const elapsed=(performance.now()-(s[side].lastSeenTs??now))/1000;
+          if(elapsed>GRACE_SEC)s[side]=null;
         }
+      }
+      // 감지된 손에 lastSeenTs 갱신
+      for(const side of['left','right']){
+        if(s[side]&&((side==='left'&&gotL)||(side==='right'&&gotR)))
+          s[side].lastSeenTs=now;
       }
     }
 
     setup();
     return()=>{
       active=false;
-      mc.port1.onmessage=null;
-      cancelAnimationFrame(rafRef.current);clearTimeout(fdTimer);
+      clearTimeout(rafRef.current);
+      clearTimeout(fdTimer);
       hlRef.current?.close();fdRef.current?.close();
       if(videoRef.current?.srcObject)videoRef.current.srcObject.getTracks().forEach(t=>t.stop());
     };
@@ -778,26 +778,25 @@ function Saber({type,handDataRef}){
       hideTimer.current=1.2; // 손 잡히면 타이머 리셋 (빠른 스윙 대응)
       grp.current.visible=true;
 
-      // ── 위치 보간: 지수 감쇠 (프레임레이트 독립적) ──
-      // halfLife: 목표까지 절반 거리 도달 시간(초). 작을수록 빠름
+      // ── 위치 보간: 고정 halfLife (setTimeout(0) 기반 추론이 충분히 빠름) ──
+      // halfLife=0.030s → 60fps 기준 한 프레임(16.6ms)에 약 31% 이동
+      // 손 움직임이 빠를수록 halfLife를 줄여 더 빠르게 추종
       const tp=data.targetPos??data.pos;
       if(!tp)return;
       const dist=sPos.current.distanceTo(tp);
-      const posHalfLife=Math.max(0.012, 0.038-dist*0.008);
+      const posHalfLife=dist>1.5?0.018:dist>0.5?0.025:0.032;
       const posAlpha=1-Math.pow(0.5, dt/posHalfLife);
       sPos.current.lerp(tp, posAlpha);
       grp.current.position.copy(sPos.current);
-      // 히트 판정용 pos 동기화
       data.pos.copy(sPos.current);
 
       // ── 방향 보간 ──
       const td=data.targetDir??data.dir;
       if(!td)return;
-      // setFromUnitVectors: (0,1,0) → td 방향으로 칼 회전
       _tQ.current.setFromUnitVectors(_UP, td);
       const targetQ=_tQ.current;
       const angleDiff=sQ.current.angleTo(targetQ);
-      const rotHalfLife=Math.max(0.018, 0.040-angleDiff*0.005);
+      const rotHalfLife=angleDiff>0.5?0.020:0.030;
       const rotAlpha=1-Math.pow(0.5, dt/rotHalfLife);
       sQ.current.slerp(targetQ, rotAlpha);
       grp.current.quaternion.copy(sQ.current);
