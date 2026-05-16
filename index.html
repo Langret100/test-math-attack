@@ -100,9 +100,7 @@ const WALL_TIME_LIMIT=5; // 5초 안에 못 부수면 하트 감소
 // 모바일: Spark/Particle/StarSpark/WallParticle 모두 이 단일 useFrame으로 처리
 // → 히트마다 useFrame N개 추가되던 것을 useFrame 1개로 통합
 // ══════════════════════════════════════
-const _particlePool=[];       // {mesh, t, life, update(mesh,t,dt,f)}
-const _particleRefs=[];       // mesh ref 등록용
-let _particlePoolReady=false;
+const _particlePool=[];
 
 // 파티클 등록 (컴포넌트 마운트 시 호출)
 function _regParticle(mesh, life, updateFn){
@@ -345,7 +343,7 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
       <mesh position={[0,1.9,0.15]} geometry={_wallHPBgGeo}>
         <meshBasicMaterial color='#111' toneMapped={false} transparent opacity={0.7}/>
       </mesh>
-      <pointLight color='#ff3300' intensity={5} distance={7} decay={2}/>
+      {!_isMobileCache&&<pointLight color='#ff3300' intensity={5} distance={7} decay={2}/>}
       {/* 불꽃 파티클 풀 */}
       {Array.from({length:SPARK_POOL},(_,i)=>(
         <mesh key={`sp${i}`} ref={el=>sparkMeshes.current[i]=el} visible={false}>
@@ -804,9 +802,10 @@ function Saber({type,handDataRef}){
       prevPos.current.copy(sPos.current);
       const spd=data.vel.length();
       swingAcc.current=THREE.MathUtils.lerp(swingAcc.current,Math.min(spd*0.07,1),0.35);
+      // glowRef/coreRef: PC는 meshStandardMaterial(emissiveIntensity 있음), 모바일은 meshBasicMaterial
       const glow=2.8+swingAcc.current*16;
-      if(glowRef.current)glowRef.current.material.emissiveIntensity=glow;
-      if(coreRef.current)coreRef.current.material.emissiveIntensity=glow*0.6;
+      if(glowRef.current?.material?.emissiveIntensity!==undefined)glowRef.current.material.emissiveIntensity=glow;
+      if(coreRef.current?.material?.emissiveIntensity!==undefined)coreRef.current.material.emissiveIntensity=glow*0.6;
       const now=performance.now();
       if(spd>2.5&&now-lastSwingT.current>110){lastSwingT.current=now;playSwing();}
       idleT.current=0;
@@ -984,6 +983,10 @@ function ExpandRing({color,speed,maxR,life,axis='z'}){
   );
 }
 
+// 빛줄기/스파크 geometry 캐싱
+const _glowRayGeo=new THREE.BoxGeometry(0.05,3.2,0.04);
+const _sparkGeo=new THREE.PlaneGeometry(1,1);
+
 // tsh를 자체 계산하는 단순 구체 메시 — 모바일 생략
 function TshMesh({color,opacity0,scale0,life,hitTime,playStartRef,back=false}){
   if(_isMobileCache)return null;
@@ -1020,11 +1023,6 @@ function GlowRay({rot,color,hitTime,playStartRef}){
     </mesh>
   );
 }
-
-const _glowRayGeo=new THREE.BoxGeometry(0.05,3.2,0.04);
-// 불꽃 스파크 이펙트 — 베었을 때 불꽃이 튀듯
-// geometry 캐싱
-const _sparkGeo=new THREE.PlaneGeometry(1,1); // scale로 조절
 
 // 불꽃 스파크 이펙트
 function Spark({dx,dy,speed,color,life,delay=0}){
@@ -1292,7 +1290,8 @@ function ObsComp({data,playStartRef}){
   const baseX=data.obstacleType==='top'?0:data.obstacleType==='left'?-2.8:2.8;
   const baseY=data.obstacleType==='top'?3.1:1.7;
   useFrame((s)=>{
-    if(mRef.current)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;
+    // emissiveIntensity는 PC(meshStandardMaterial)에만 존재
+    if(!_isMobileCache&&mRef.current)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;
     if(grpRef.current){
       const time=(performance.now()-playStartRef.current)/1000;
       const cz=PLAYER_Z-(data.time-time)*NOTE_SPEED;
@@ -1320,7 +1319,7 @@ function ObsComp({data,playStartRef}){
       <mesh position={conePos} rotation={coneRot} geometry={obsConeGeo}>
         <meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>
       </mesh>
-      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
+      {!_isMobileCache&&<pointLight color={col} intensity={2.2} distance={5} decay={2}/>}
     </group>
   );
 }
@@ -1412,7 +1411,7 @@ function bladeHit(hand, nx, ny){
 function GameScene({gameStatus,audioRef,handDataRef,headPositionRef,
                     chartRef,multRef,playStartRef,
                     onNoteHit,onNoteMiss,onObstacleHit,onMultChange,
-                    onWallStart,onWallHit,onWallBreak,onWallTimeout,wallRef,wallVisible,wallBreaking,resetKey}){
+                    onWallStart,onWallHit,onWallBreak,onWallTimeout,wallRef,wallVisible,wallBreaking}){
   const[tick,setTick]=useState(0);
   const bump=useCallback(()=>setTick(t=>t+1),[]);
   const ctRef=useRef(0); // 실시간 게임시간 ref — state 지연 없음
@@ -1795,7 +1794,6 @@ function App(){
   const[obsW,setObsW]=useState(null);
   const[flash,setFlash]=useState(false);
   const[hitMsg,setHitMsg]=useState(null);
-  const[gameKey,setGameKey]=useState(0); // 게임 시작마다 증가 → GameScene 강제 리마운트
 
   const audioRef=useRef(null);
   if(audioRef.current===null){const a=new Audio(SONG_URL);a.loop=true;audioRef.current=a;}
@@ -2018,8 +2016,7 @@ function App(){
           onNoteHit={onHit} onNoteMiss={onMiss} onObstacleHit={onObsHit}
           onMultChange={onMultChange}
           wallRef={wallRef} onWallHit={onWallHit} onWallBreak={onWallBreak} onWallTimeout={onWallTimeout}
-          wallVisible={wallVisible} wallBreaking={wallBreaking}
-          resetKey={gameKey}/>
+          wallVisible={wallVisible} wallBreaking={wallBreaking}/>
       </Canvas>
 
       <WebcamPreview videoRef={videoRef} resultsRef={lastResultsRef} isCameraReady={isCameraReady}/>
