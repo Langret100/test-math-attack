@@ -769,7 +769,7 @@ function useMediaPipe(videoRef){
           facingMode:'user',
           width:{ideal:isMob?480:isTouchDev?640:1280},
           height:{ideal:isMob?360:isTouchDev?480:720},
-          frameRate:{ideal:60}
+          frameRate:{ideal:isMob?30:60}
         }});
         if(videoRef.current&&active){
           videoRef.current.srcObject=stream;
@@ -824,15 +824,19 @@ function useMediaPipe(videoRef){
     // 손 감지: 이전엔 setTimeout(0) 무제한 폴링 + 매번 detectForVideo 실행 → 같은 비디오
     // 프레임에 대해서도 계속 추론이 돌아서 낭비가 컸음. requestVideoFrameCallback으로
     // fps를 강제로 캡했더니 반응성이 떨어져서(체감 렉), 다시 최대 속도 폴링으로 되돌리되
-    // "실제로 새 프레임이 왔을 때만" 무거운 추론을 실행하도록 currentTime만 비교
-    let lastVideoTime=-1;
+    // "실제로 새 프레임이 왔을 때만" 무거운 추론을 실행하도록 currentTime만 비교.
+    // 모바일은 카메라 fps를 30으로 낮췄지만(위 getUserMedia), 안전장치로 추론 자체도
+    // 최소 간격(약 30fps)으로 한 번 더 캡해서 렌더링과의 메인스레드/GPU 경합을 줄인다.
+    let lastVideoTime=-1,lastHlRunTs=0;
+    const HL_MIN_INTERVAL=_isMobileCache?1000/30:0;
     function loop(){
       if(!active)return;
       const v=videoRef.current;
       if(v&&v.videoWidth>0&&v.readyState>=2&&hlRef.current){
         const vt=v.currentTime;
-        if(vt!==lastVideoTime){ // 새 프레임일 때만 추론 (중복 추론 낭비 제거)
-          lastVideoTime=vt;
+        const nowP=performance.now();
+        if(vt!==lastVideoTime&&(nowP-lastHlRunTs)>=HL_MIN_INTERVAL){ // 새 프레임 + 최소 간격 통과 시만 추론
+          lastVideoTime=vt;lastHlRunTs=nowP;
           hlTs=Math.max(hlTs+1,Math.floor(performance.now()));
           try{const hr=hlRef.current.detectForVideo(v,hlTs);lrRef.current=hr;processHands(hr);}
           catch(e){hlTs+=2;}
@@ -1031,18 +1035,22 @@ function Saber({type,handDataRef}){
         <cylinderGeometry args={[bladeCoreR,bladeCoreR,L,8]}/>
         <meshBasicMaterial color="white" toneMapped={false}/>
       </mesh>
-      {/* 블레이드 글로우 외층 */}
+      {/* 블레이드 글로우 외층 — 모바일은 조명 계산 없는 unlit 머티리얼로 비용 절감 */}
       <mesh ref={glowRef} position={[0,0.09+L/2,0]}>
         <capsuleGeometry args={[glowR,L,8,14]}/>
-        <meshStandardMaterial color={col} emissive={col} emissiveIntensity={2.8} toneMapped={false} transparent opacity={0.5}/>
+        {isMob
+          ?<meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.55}/>
+          :<meshStandardMaterial color={col} emissive={col} emissiveIntensity={2.8} toneMapped={false} transparent opacity={0.5}/>}
       </mesh>
       {/* 블레이드 중간층 (색상 선명하게) */}
       <mesh ref={coreRef} position={[0,0.09+L/2,0]}>
         <capsuleGeometry args={[midR,L,6,10]}/>
-        <meshStandardMaterial color="white" emissive={col} emissiveIntensity={1.8} toneMapped={false} transparent opacity={0.75}/>
+        {isMob
+          ?<meshBasicMaterial color="white" toneMapped={false} transparent opacity={0.8}/>
+          :<meshStandardMaterial color="white" emissive={col} emissiveIntensity={1.8} toneMapped={false} transparent opacity={0.75}/>}
       </mesh>
-      <pointLight color={col} intensity={6} distance={7} decay={2} position={[0,1.4,0]}/>
-      <pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>
+      <pointLight color={col} intensity={isMob?4:6} distance={isMob?5:7} decay={2} position={[0,1.4,0]}/>
+      {!isMob&&<pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>}
     </group>
   );
 }
@@ -1358,14 +1366,16 @@ function NoteComp({data,playStartRef,multRef}){
     return(
       <group ref={grp} position={[nx,ny,0]}>
         <mesh geometry={panelGeo}>
-          <meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6} emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>
+          {_isMobileCache
+            ?<meshBasicMaterial color="#1a0010" toneMapped={false} transparent opacity={0.5}/>
+            :<meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6} emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>}
         </mesh>
         <Text position={[0,0,PD/2+0.02]} fontSize={PH*0.65} color="#ff6eb4" anchorX="center" anchorY="middle"
           outlineColor="#ec4899" outlineWidth={0.018}>♥</Text>
         <lineSegments geometry={edgesGeo}>
           <lineBasicMaterial color="#ec4899" toneMapped={false}/>
         </lineSegments>
-        <pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>
+        {!_isMobileCache&&<pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>}
       </group>
     );
   }
@@ -1373,7 +1383,9 @@ function NoteComp({data,playStartRef,multRef}){
   return(
     <group ref={grp} position={[nx,ny,0]}>
       <mesh geometry={panelGeo}>
-        <meshStandardMaterial color={noteColor} roughness={0.05} metalness={0.15} emissive={noteColor} emissiveIntensity={isCorrect?0.4:0.22} transparent opacity={0.38}/>
+        {_isMobileCache
+          ?<meshBasicMaterial color={noteColor} toneMapped={false} transparent opacity={isCorrect?0.42:0.3}/>
+          :<meshStandardMaterial color={noteColor} roughness={0.05} metalness={0.15} emissive={noteColor} emissiveIntensity={isCorrect?0.4:0.22} transparent opacity={0.38}/>}
       </mesh>
       <mesh position={[0,0,PD/2+0.002]} geometry={_noteFaceGeo}>
         <meshBasicMaterial color="white" transparent opacity={0.07}/>
@@ -1403,11 +1415,12 @@ function ObsComp({data,playStartRef}){
   const grpRef=useRef();
   const mRef=useRef();
   const col=COL.obstacle;
+  const isMob=_isMobileCache;
   const baseX=data.obstacleType==='top'?0:data.obstacleType==='left'?-2.8:2.8;
   const baseY=data.obstacleType==='top'?3.1:1.7;
   useFrame((s)=>{
-    // emissiveIntensity는 PC(meshStandardMaterial)에만 존재
-    if(mRef.current)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;
+    // emissiveIntensity는 PC(meshStandardMaterial)에만 존재, 모바일은 unlit이라 no-op
+    if(mRef.current&&mRef.current.emissiveIntensity!==undefined)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;
     if(grpRef.current){
       const time=(performance.now()-playStartRef.current)/1000;
       const cz=PLAYER_Z-(data.time-time)*NOTE_SPEED;
@@ -1424,7 +1437,9 @@ function ObsComp({data,playStartRef}){
   return(
     <group ref={grpRef} position={[baseX,baseY,0]}>
       <mesh geometry={geoBody}>
-        <meshStandardMaterial ref={mRef} color={col} emissive={col} emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>
+        {isMob
+          ?<meshBasicMaterial ref={mRef} color={col} toneMapped={false} transparent opacity={0.42} depthWrite={false}/>
+          :<meshStandardMaterial ref={mRef} color={col} emissive={col} emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>}
       </mesh>
       <lineSegments geometry={geoEdges}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
@@ -1432,7 +1447,7 @@ function ObsComp({data,playStartRef}){
       <mesh position={conePos} rotation={coneRot} geometry={obsConeGeo}>
         <meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>
       </mesh>
-      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
+      {!isMob&&<pointLight color={col} intensity={2.2} distance={5} decay={2}/>}
     </group>
   );
 }
@@ -1444,8 +1459,12 @@ const _fs=(b,mn=10,mx=999)=>({fontSize:`clamp(${mn}px,${b},${mx}px)`});
 const HCONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
 function WebcamPreview({videoRef,resultsRef,isCameraReady}){
   const cv=useRef();
+  // 모바일에서는 카메라 미리보기가 게임플레이에 필요 없는데도 매 프레임
+  // drawImage + 손 랜드마크 그리기(2D canvas)를 별도 rAF 루프로 계속 돌려서
+  // CPU를 잡아먹었음 → 폰에서는 아예 마운트하지 않아 루프 자체를 제거
+  const isPhone=_isMobileCache;
   useEffect(()=>{
-    if(!isCameraReady)return;let af;
+    if(!isCameraReady||isPhone)return;let af;
     const TARGET_FPS=30;
     const INTERVAL=1000/TARGET_FPS;
     let lastDraw=0;
@@ -1474,20 +1493,19 @@ function WebcamPreview({videoRef,resultsRef,isCameraReady}){
       }
     };
     af=requestAnimationFrame(draw);return()=>cancelAnimationFrame(af);
-  },[isCameraReady,videoRef,resultsRef]);
-  if(!isCameraReady)return null;
-  const isPhone=_isMobileCache;
+  },[isCameraReady,videoRef,resultsRef,isPhone]);
+  if(!isCameraReady||isPhone)return null;
   const isTab=_isTablet();
   return(
     <div style={{position:'fixed',
-      bottom: isPhone?'auto':8,
-      top: isPhone?8:'auto',
+      bottom: 8,
+      top: 'auto',
       right:8,
-      width: isPhone?'clamp(60px,15vw,90px)':isTab?'clamp(120px,14vw,160px)':'clamp(110px,16vw,190px)',
-      height: isPhone?'clamp(80px,20vw,120px)':isTab?'clamp(90px,10.5vw,120px)':'clamp(82px,12vw,142px)',
+      width: isTab?'clamp(120px,14vw,160px)':'clamp(110px,16vw,190px)',
+      height: isTab?'clamp(90px,10.5vw,120px)':'clamp(82px,12vw,142px)',
       border:'2px solid rgba(59,130,246,.45)',borderRadius:9,overflow:'hidden',
       zIndex:50,pointerEvents:'none',background:'#000',
-      opacity: isPhone?0.72:1}}>
+      opacity: 1}}>
       <div style={{position:'absolute',top:0,left:0,right:0,zIndex:1,background:'rgba(0,0,0,.6)',
         fontSize:8,color:'rgba(147,197,253,.8)',padding:'2px 4px',fontFamily:'monospace',letterSpacing:1}}>CAM</div>
       <canvas ref={cv} width={320} height={240}
@@ -2234,7 +2252,7 @@ function App(){
         </button>
       )}
       <Canvas className="r3f-canvas" frameloop="always"
-        dpr={[1, _isMobileCache?1:(_isTablet()?1.25:Math.min(window.devicePixelRatio??1, 1.5))]}
+        dpr={_isMobileCache?[0.75,0.75]:[1, _isTablet()?1.25:Math.min(window.devicePixelRatio??1, 1.5)]}
         gl={{antialias:false,powerPreference:'high-performance',
              stencil:false,depth:true,alpha:false}} shadows={false}>
         <color attach="background" args={['#05050a']}/>
