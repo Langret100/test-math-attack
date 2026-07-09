@@ -751,14 +751,20 @@ function useMediaPipe(videoRef){
         const vision=await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm');
         if(!active)return;
+        // 모바일: GPU 딜리게이트를 쓰면 mediapipe 내부 WebGL 컨텍스트와 three.js
+        // 캔버스의 WebGL 컨텍스트가 하나의 GPU를 번갈아 점유(컨텍스트 스위칭)하면서
+        // 매 추론마다 렌더 파이프라인이 멈칫거리는 현상이 있음(특히 저사양 모바일 GPU
+        // 드라이버). 화면 해상도/조명을 아무리 줄여도 이 병목은 그대로였을 가능성이 커서
+        // 모바일에서는 CPU(WASM) 딜리게이트로 돌려 GPU를 렌더링 전용으로 비워준다.
+        const _mpDelegate=_isMobileCache?'CPU':'GPU';
         const hl=await HandLandmarker.createFromOptions(vision,{
-          baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},
+          baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:_mpDelegate},
           runningMode:'VIDEO',numHands:2,
           minHandDetectionConfidence:0.7,minHandPresenceConfidence:0.5,minTrackingConfidence:0.5
         });
         if(!active){hl.close();return;}
         const fd=await FaceDetector.createFromOptions(vision,{
-          baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',delegate:'GPU'},
+          baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',delegate:_mpDelegate},
           runningMode:'VIDEO',minDetectionConfidence:0.4
         });
         if(!active){hl.close();fd.close();return;}
@@ -767,8 +773,8 @@ function useMediaPipe(videoRef){
         const isTouchDev=_isTouchDevice();
         const stream=await navigator.mediaDevices.getUserMedia({video:{
           facingMode:'user',
-          width:{ideal:isMob?480:isTouchDev?640:1280},
-          height:{ideal:isMob?360:isTouchDev?480:720},
+          width:{ideal:isMob?400:isTouchDev?640:1280},
+          height:{ideal:isMob?300:isTouchDev?480:720},
           frameRate:{ideal:isMob?30:60}
         }});
         if(videoRef.current&&active){
@@ -1035,22 +1041,25 @@ function Saber({type,handDataRef}){
         <cylinderGeometry args={[bladeCoreR,bladeCoreR,L,8]}/>
         <meshBasicMaterial color="white" toneMapped={false}/>
       </mesh>
-      {/* 블레이드 글로우 외층 — 모바일은 조명 계산 없는 unlit 머티리얼로 비용 절감 */}
+      {/* 블레이드 글로우 외층 — 모바일은 조명 계산 없는 unlit + 가산 블렌딩으로
+          "빛나는" 느낌은 살리면서 비용은 여전히 저렴하게 유지 */}
       <mesh ref={glowRef} position={[0,0.09+L/2,0]}>
         <capsuleGeometry args={[glowR,L,8,14]}/>
         {isMob
-          ?<meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.55}/>
+          ?<meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85} blending={THREE.AdditiveBlending} depthWrite={false}/>
           :<meshStandardMaterial color={col} emissive={col} emissiveIntensity={2.8} toneMapped={false} transparent opacity={0.5}/>}
       </mesh>
       {/* 블레이드 중간층 (색상 선명하게) */}
       <mesh ref={coreRef} position={[0,0.09+L/2,0]}>
         <capsuleGeometry args={[midR,L,6,10]}/>
         {isMob
-          ?<meshBasicMaterial color="white" toneMapped={false} transparent opacity={0.8}/>
+          ?<meshBasicMaterial color="white" toneMapped={false} transparent opacity={0.9} blending={THREE.AdditiveBlending} depthWrite={false}/>
           :<meshStandardMaterial color="white" emissive={col} emissiveIntensity={1.8} toneMapped={false} transparent opacity={0.75}/>}
       </mesh>
-      <pointLight color={col} intensity={isMob?4:6} distance={isMob?5:7} decay={2} position={[0,1.4,0]}/>
-      {!isMob&&<pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>}
+      {/* 실제 병목이 조명이 아니라 mediapipe/GPU 경합 쪽이라는 게 확인돼서
+          모바일에서도 라이트는 원래대로 복원(화려함 우선) */}
+      <pointLight color={col} intensity={6} distance={7} decay={2} position={[0,1.4,0]}/>
+      <pointLight color={col} intensity={3} distance={4} decay={2} position={[0,-0.1,0]}/>
     </group>
   );
 }
@@ -1375,7 +1384,7 @@ function NoteComp({data,playStartRef,multRef}){
         <lineSegments geometry={edgesGeo}>
           <lineBasicMaterial color="#ec4899" toneMapped={false}/>
         </lineSegments>
-        {!_isMobileCache&&<pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>}
+        <pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>
       </group>
     );
   }
@@ -1447,7 +1456,7 @@ function ObsComp({data,playStartRef}){
       <mesh position={conePos} rotation={coneRot} geometry={obsConeGeo}>
         <meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>
       </mesh>
-      {!isMob&&<pointLight color={col} intensity={2.2} distance={5} decay={2}/>}
+      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
     </group>
   );
 }
