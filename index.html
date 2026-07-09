@@ -722,6 +722,65 @@ function freshChart(mult){
 // ══════════════════════════════════════
 // useMediaPipe
 // ══════════════════════════════════════
+// ══════════════════════════════════════
+// 모바일 전용: mediapipe를 Web Worker로 분리
+// ══════════════════════════════════════
+// detectForVideo()는 동기 함수라 호출되는 동안 실행 스레드를 완전히 막는다(공식 문서
+// 명시 사항). 메인 스레드에서 돌리면 그 시간만큼 three.js 렌더(rAF)도 같이 멈춰서
+// 60fps에 도달할 수 없는 구조적 한계가 생긴다. → 추론 자체를 별도 워커 스레드로 옮겨
+// 메인 스레드는 오직 렌더링+카메라 프레임 전달만 하도록 분리한다.
+function _createMediaPipeWorker(){
+  const src=`
+import{FilesetResolver,HandLandmarker,FaceDetector}from'https://esm.run/@mediapipe/tasks-vision@0.10.9';
+let hl=null,fd=null,frameCount=0,ready=false;
+self.onmessage=async(e)=>{
+  const msg=e.data;
+  if(msg.type==='init'){
+    try{
+      const vision=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm');
+      hl=await HandLandmarker.createFromOptions(vision,{
+        baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'CPU'},
+        runningMode:'VIDEO',numHands:2,
+        minHandDetectionConfidence:0.7,minHandPresenceConfidence:0.5,minTrackingConfidence:0.5
+      });
+      fd=await FaceDetector.createFromOptions(vision,{
+        baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',delegate:'CPU'},
+        runningMode:'VIDEO',minDetectionConfidence:0.4
+      });
+      ready=true;
+      self.postMessage({type:'ready'});
+    }catch(err){
+      self.postMessage({type:'error',message:String((err&&err.message)||err)});
+    }
+    return;
+  }
+  if(msg.type==='frame'){
+    const bmp=msg.bitmap;
+    if(!ready||!hl){bmp.close();return;}
+    const ts=msg.ts;
+    let handResult=null,faceResult=null;
+    try{handResult=hl.detectForVideo(bmp,ts);}catch(err){}
+    frameCount++;
+    // 얼굴 감지는 4프레임에 1번만 (워커 안에서도 불필요한 연산은 줄임)
+    if(fd&&frameCount%4===0){
+      try{faceResult=fd.detectForVideo(bmp,ts);}catch(err){}
+    }
+    bmp.close();
+    self.postMessage({type:'result',hand:handResult,face:faceResult,hasFace:frameCount%4===0});
+    return;
+  }
+  if(msg.type==='close'){
+    try{hl?.close();fd?.close();}catch(err){}
+  }
+};
+`;
+  const blob=new Blob([src],{type:'text/javascript'});
+  const url=URL.createObjectURL(blob);
+  const worker=new Worker(url,{type:'module'});
+  worker._blobUrl=url;
+  return worker;
+}
+
 function useMediaPipe(videoRef){
   const[ready,setReady]=useState(false);
   const[err,setErr]=useState(null);
@@ -745,37 +804,37 @@ function useMediaPipe(videoRef){
   useEffect(()=>{
     let active=true,hlTs=0,fdTs=0;
     let fdTimer=null;
+    let worker=null,workerBusy=false,mobileFrameTimer=null,mobileFrameCount=0,mpTs=0;
 
     async function setup(){
+      if(_isMobileCache){ await setupMobileWorker(); return; }
+      await setupDesktopMainThread();
+    }
+
+    // ── PC/태블릿: 기존 방식 그대로(메인 스레드에서 직접 detectForVideo) ──
+    async function setupDesktopMainThread(){
       try{
         const vision=await FilesetResolver.forVisionTasks(
           'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.9/wasm');
         if(!active)return;
-        // 모바일: GPU 딜리게이트를 쓰면 mediapipe 내부 WebGL 컨텍스트와 three.js
-        // 캔버스의 WebGL 컨텍스트가 하나의 GPU를 번갈아 점유(컨텍스트 스위칭)하면서
-        // 매 추론마다 렌더 파이프라인이 멈칫거리는 현상이 있음(특히 저사양 모바일 GPU
-        // 드라이버). 화면 해상도/조명을 아무리 줄여도 이 병목은 그대로였을 가능성이 커서
-        // 모바일에서는 CPU(WASM) 딜리게이트로 돌려 GPU를 렌더링 전용으로 비워준다.
-        const _mpDelegate=_isMobileCache?'CPU':'GPU';
         const hl=await HandLandmarker.createFromOptions(vision,{
-          baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:_mpDelegate},
+          baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',delegate:'GPU'},
           runningMode:'VIDEO',numHands:2,
           minHandDetectionConfidence:0.7,minHandPresenceConfidence:0.5,minTrackingConfidence:0.5
         });
         if(!active){hl.close();return;}
         const fd=await FaceDetector.createFromOptions(vision,{
-          baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',delegate:_mpDelegate},
+          baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite',delegate:'GPU'},
           runningMode:'VIDEO',minDetectionConfidence:0.4
         });
         if(!active){hl.close();fd.close();return;}
         hlRef.current=hl;fdRef.current=fd;
-        const isMob=_isMobileCache;
         const isTouchDev=_isTouchDevice();
         const stream=await navigator.mediaDevices.getUserMedia({video:{
           facingMode:'user',
-          width:{ideal:isMob?400:isTouchDev?640:1280},
-          height:{ideal:isMob?300:isTouchDev?480:720},
-          frameRate:{ideal:isMob?30:60}
+          width:{ideal:isTouchDev?640:1280},
+          height:{ideal:isTouchDev?480:720},
+          frameRate:{ideal:60}
         }});
         if(videoRef.current&&active){
           videoRef.current.srcObject=stream;
@@ -793,11 +852,95 @@ function useMediaPipe(videoRef){
               }catch(e){}
               setReady(true);
               fdLoop(); // 얼굴 감지 별도 루프 시작
-              loop();   // 손+얼굴 루프 시작
+              loop();   // 손 감지 루프 시작
             },200);
           };
         }
       }catch(e){console.error(e);setErr(e.message);}
+    }
+
+    // ── 모바일: Web Worker에서 detectForVideo 실행 ──
+    // detectForVideo는 동기 함수라 실행되는 동안 호출 스레드를 완전히 막는다(Google
+    // 공식 문서 기재 사항). 메인 스레드에서 부르면 그 시간만큼 렌더링도 멈추기 때문에,
+    // 별도 워커 스레드에서 돌려서 메인 스레드(=렌더 루프)를 절대 막지 않게 한다.
+    async function setupMobileWorker(){
+      try{
+        worker=_createMediaPipeWorker();
+        const readyPromise=new Promise((resolve,reject)=>{
+          const onMsg=(e)=>{
+            if(e.data.type==='ready'){worker.removeEventListener('message',onMsg);resolve();}
+            else if(e.data.type==='error'){worker.removeEventListener('message',onMsg);reject(new Error(e.data.message));}
+          };
+          worker.addEventListener('message',onMsg);
+        });
+        worker.postMessage({type:'init'});
+        await readyPromise;
+        if(!active){worker.terminate();return;}
+
+        const stream=await navigator.mediaDevices.getUserMedia({video:{
+          facingMode:'user',
+          width:{ideal:400},height:{ideal:300},frameRate:{ideal:30}
+        }});
+        if(!videoRef.current||!active){stream.getTracks().forEach(t=>t.stop());return;}
+        videoRef.current.srcObject=stream;
+
+        // 결과 수신: 손은 매번, 얼굴은 워커가 4프레임에 1번만 계산해서 보내줌
+        worker.addEventListener('message',(e)=>{
+          if(!active)return;
+          const msg=e.data;
+          if(msg.type==='result'){
+            workerBusy=false;
+            if(msg.hand){lrRef.current=msg.hand;processHands(msg.hand);}
+            if(msg.hasFace)applyFaceResult(msg.face);
+          }
+        });
+
+        videoRef.current.onloadeddata=()=>{
+          if(!active)return;
+          setTimeout(()=>{
+            if(!active)return;
+            setReady(true);
+            mobileFrameLoop();
+          },200);
+        };
+      }catch(e){console.error(e);setErr(e.message);}
+    }
+
+    // 비디오에서 새 프레임이 나올 때마다(최대 30fps, 카메라 fps에 맞춤) ImageBitmap을
+    // 만들어 워커로 전달. 워커가 이전 프레임을 아직 처리 중이면(workerBusy) 건너뛰어
+    // 큐가 계속 쌓이며 지연이 누적되는 것을 방지한다(항상 "최신 프레임"만 추론).
+    let lastMobileVideoTime=-1;
+    function mobileFrameLoop(){
+      if(!active||!worker)return;
+      const v=videoRef.current;
+      if(v&&v.videoWidth>0&&v.readyState>=2&&!workerBusy){
+        const vt=v.currentTime;
+        if(vt!==lastMobileVideoTime){
+          lastMobileVideoTime=vt;
+          workerBusy=true;
+          createImageBitmap(v).then(bmp=>{
+            if(!active||!worker){bmp.close();return;}
+            mpTs=Math.max(mpTs+1,Math.floor(performance.now()));
+            worker.postMessage({type:'frame',bitmap:bmp,ts:mpTs},[bmp]);
+          }).catch(()=>{workerBusy=false;});
+        }
+      }
+      mobileFrameTimer=setTimeout(mobileFrameLoop,1000/30);
+    }
+
+    function applyFaceResult(fr){
+      if(!fr)return;
+      if(fr.detections?.length>0){
+        const bb=fr.detections[0].boundingBox;
+        const v=videoRef.current;
+        const W=v?.videoWidth||1,H=v?.videoHeight||1;
+        const cx=(bb.originX+bb.width*0.5)/W;
+        const cy=(bb.originY+bb.height*0.5)/H;
+        const bh=bb.height/H;
+        headRef.current={x:1-cx,y:cy,h:bh,detected:true};
+      }else{
+        headRef.current={...headRef.current,detected:false};
+      }
     }
 
     // 얼굴 감지: 완전 별도 타이머 (모바일 8fps=125ms, PC 10fps=100ms)
@@ -811,38 +954,24 @@ function useMediaPipe(videoRef){
           if(fdNow>fdTs){
             fdTs=fdNow;
             const fr=fdRef.current.detectForVideo(v,fdTs);
-            if(fr.detections?.length>0){
-              const bb=fr.detections[0].boundingBox;
-              const W=v.videoWidth,H=v.videoHeight;
-              const cx=(bb.originX+bb.width*0.5)/W;
-              const cy=(bb.originY+bb.height*0.5)/H;
-              const bh=bb.height/H;
-              headRef.current={x:1-cx,y:cy,h:bh,detected:true};
-            }else{
-              headRef.current={...headRef.current,detected:false};
-            }
+            applyFaceResult(fr);
           }
         }catch(e){}
       }
       fdTimer=setTimeout(fdLoop, 100);
     }
 
-    // 손 감지: 이전엔 setTimeout(0) 무제한 폴링 + 매번 detectForVideo 실행 → 같은 비디오
-    // 프레임에 대해서도 계속 추론이 돌아서 낭비가 컸음. requestVideoFrameCallback으로
-    // fps를 강제로 캡했더니 반응성이 떨어져서(체감 렉), 다시 최대 속도 폴링으로 되돌리되
-    // "실제로 새 프레임이 왔을 때만" 무거운 추론을 실행하도록 currentTime만 비교.
-    // 모바일은 카메라 fps를 30으로 낮췄지만(위 getUserMedia), 안전장치로 추론 자체도
-    // 최소 간격(약 30fps)으로 한 번 더 캡해서 렌더링과의 메인스레드/GPU 경합을 줄인다.
-    let lastVideoTime=-1,lastHlRunTs=0;
-    const HL_MIN_INTERVAL=_isMobileCache?1000/30:0;
+    // 손 감지(PC/태블릿 전용): setTimeout(0) 무제한 폴링 + "새 비디오 프레임일 때만"
+    // 추론 실행(currentTime 비교)해서 같은 프레임에 대한 중복 추론 낭비를 없앤다.
+    // 모바일은 위 setupMobileWorker/mobileFrameLoop 경로를 쓰므로 이 루프를 타지 않는다.
+    let lastVideoTime=-1;
     function loop(){
       if(!active)return;
       const v=videoRef.current;
       if(v&&v.videoWidth>0&&v.readyState>=2&&hlRef.current){
         const vt=v.currentTime;
-        const nowP=performance.now();
-        if(vt!==lastVideoTime&&(nowP-lastHlRunTs)>=HL_MIN_INTERVAL){ // 새 프레임 + 최소 간격 통과 시만 추론
-          lastVideoTime=vt;lastHlRunTs=nowP;
+        if(vt!==lastVideoTime){
+          lastVideoTime=vt;
           hlTs=Math.max(hlTs+1,Math.floor(performance.now()));
           try{const hr=hlRef.current.detectForVideo(v,hlTs);lrRef.current=hr;processHands(hr);}
           catch(e){hlTs+=2;}
@@ -914,8 +1043,13 @@ function useMediaPipe(videoRef){
     setup();
     return()=>{
       active=false;
-      clearTimeout(rafRef.current);clearTimeout(fdTimer);
+      clearTimeout(rafRef.current);clearTimeout(fdTimer);clearTimeout(mobileFrameTimer);
       hlRef.current?.close();fdRef.current?.close();
+      if(worker){
+        try{worker.postMessage({type:'close'});}catch(e){}
+        worker.terminate();
+        if(worker._blobUrl)URL.revokeObjectURL(worker._blobUrl);
+      }
       if(videoRef.current?.srcObject)videoRef.current.srcObject.getTracks().forEach(t=>t.stop());
     };
   },[videoRef]);
