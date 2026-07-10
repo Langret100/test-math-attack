@@ -763,7 +763,7 @@ self.onmessage=async(e)=>{
   }
   if(msg.type==='frame'){
     const bmp=msg.bitmap;
-    if(!ready||!hl){bmp.close();return;}
+    if(!ready||!hl){bmp.close();self.postMessage({type:'result',hand:null,face:null,hasFace:false});return;}
     const ts=msg.ts;
     let handResult=null,faceResult=null;
     try{handResult=hl.detectForVideo(bmp,ts);}catch(err){}
@@ -888,7 +888,10 @@ function useMediaPipe(videoRef){
 
         const stream=await navigator.mediaDevices.getUserMedia({video:{
           facingMode:'user',
-          width:{ideal:400},height:{ideal:300},frameRate:{ideal:30}
+          width:{ideal:400},height:{ideal:300},
+          // min을 같이 주면 저조도 등에서 카메라가 노출시간을 늘리려고
+          // 프레임레이트를 조용히 낮춰버리는 걸 어느 정도 막아준다(기기가 지원하는 선에서).
+          frameRate:{ideal:30,min:20}
         }});
         if(!videoRef.current||!active){stream.getTracks().forEach(t=>t.stop());return;}
         videoRef.current.srcObject=stream;
@@ -918,17 +921,21 @@ function useMediaPipe(videoRef){
     // 비디오에서 새 프레임이 나올 때마다(최대 30fps, 카메라 fps에 맞춤) ImageBitmap을
     // 만들어 워커로 전달. 워커가 이전 프레임을 아직 처리 중이면(workerBusy) 건너뛰어
     // 큐가 계속 쌓이며 지연이 누적되는 것을 방지한다(항상 "최신 프레임"만 추론).
-    let lastMobileVideoTime=-1;
+    let lastMobileVideoTime=-1,workerBusySince=0;
     function mobileFrameLoop(){
       if(!active||!worker)return;
+      // 워치독: 워커 응답이 유실되는 등의 이유로 workerBusy가 계속 true로 남아있으면
+      // 그 뒤로 영원히 새 프레임을 안 보내게 되어(=손 추적 완전 정지) 버린다.
+      // 800ms 넘게 응답이 없으면 강제로 풀어서 다시 흐르게 한다.
+      if(workerBusy&&performance.now()-workerBusySince>800)workerBusy=false;
       const v=videoRef.current;
       if(v&&v.videoWidth>0&&v.readyState>=2&&!workerBusy){
         const vt=v.currentTime;
         if(vt!==lastMobileVideoTime){
           lastMobileVideoTime=vt;
-          workerBusy=true;
+          workerBusy=true;workerBusySince=performance.now();
           createImageBitmap(v).then(bmp=>{
-            if(!active||!worker){bmp.close();return;}
+            if(!active||!worker){bmp.close();workerBusy=false;return;}
             mpTs=Math.max(mpTs+1,Math.floor(performance.now()));
             worker.postMessage({type:'frame',bitmap:bmp,ts:mpTs},[bmp]);
           }).catch(()=>{workerBusy=false;});
@@ -1020,8 +1027,18 @@ function useMediaPipe(videoRef){
         const lm=best.lm;
         const cx=(lm[0].x+lm[5].x+lm[17].x)/3;
         const cy=(lm[0].y+lm[5].y+lm[17].y)/3;
-        const tx=(0.5-cx)*xScale;
+        let tx=(0.5-cx)*xScale;
         const ty=(1-cy)*yScale+yOff;
+        if(isMobile){
+          // 모바일 세로화면: 손을 크게 휘두르면 칼자루 자체가 카메라 프러스텀
+          // (실제로 화면에 보이는 범위) 밖으로 나가버려서 화면 양옆으로 사라짐.
+          // GameScene의 카메라 FOV 자동보정 로직이 노트 레인 최대값(±1.0)에 15%
+          // 여유(±1.15)를 더한 범위는 어떤 화면비에서도 항상 보이도록 보장하므로,
+          // 그 보장된 범위 안쪽(±1.05)으로 클램프하면 화면 비율 계산을 다시 하지
+          // 않아도 항상 안전하고, 가장 바깥 레인(±1.0)도 여유 있게 닿는다.
+          const maxX=1.05;
+          tx=Math.max(-maxX,Math.min(maxX,tx));
+        }
 
         // ── 칼날 방향: 손목(0) → 중지MCP(9) ──
         // 롱소드를 쥔 자세: 손목=칼자루끝, 손목→중지MCP = 칼이 뻗는 방향
