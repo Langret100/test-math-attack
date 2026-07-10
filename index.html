@@ -934,7 +934,10 @@ function useMediaPipe(videoRef){
         if(vt!==lastMobileVideoTime){
           lastMobileVideoTime=vt;
           workerBusy=true;workerBusySince=performance.now();
-          createImageBitmap(v).then(bmp=>{
+          // 카메라의 ideal 해상도 요청은 기기가 무시하고 더 큰 해상도를 줄 수도 있어서,
+          // 워커로 보내기 전에 확실히 작은 고정 크기로 리사이즈해 추론 전처리 비용을
+          // 항상 가볍게 유지한다(저사양 CPU에서 콜백 주기가 들쭉날쭉해지는 것을 완화).
+          createImageBitmap(v,{resizeWidth:256,resizeHeight:192,resizeQuality:'low'}).then(bmp=>{
             if(!active||!worker){bmp.close();workerBusy=false;return;}
             mpTs=Math.max(mpTs+1,Math.floor(performance.now()));
             worker.postMessage({type:'frame',bitmap:bmp,ts:mpTs},[bmp]);
@@ -1049,8 +1052,20 @@ function useMediaPipe(videoRef){
         const sdz =  (lm[9].z - lm[0].z) * 2.5;
         const rawDir=new THREE.Vector3(sdx, sdy, sdz).normalize();
 
-        if(!s[side])s[side]={pos:new THREE.Vector3(tx,ty,0),dir:rawDir.clone(),vel:new THREE.Vector3(),targetPos:new THREE.Vector3(tx,ty,0),targetDir:rawDir.clone(),graceCount:0};
-        else{s[side].targetPos.set(tx,ty,0);s[side].targetDir.copy(rawDir);}
+        if(!s[side])s[side]={pos:new THREE.Vector3(tx,ty,0),dir:rawDir.clone(),vel:new THREE.Vector3(),targetPos:new THREE.Vector3(tx,ty,0),targetVel:new THREE.Vector3(),targetDir:rawDir.clone(),lastUpdateTs:now,graceCount:0};
+        else{
+          // 저사양 기기는 추론이 30fps를 못 따라가서 이 콜백 자체가 뜨문뜨문(가변 간격으로)
+          // 호출될 수 있다. 목표 위치만 갱신하면 렌더 루프가 도착 즉시 멈춰버려서
+          // "움직이다 뚝뚝 끊기는" 느낌이 나므로, 실제 걸린 시간(dtUpdate) 기준
+          // 이동속도도 같이 계산해 저장해둔다 → useFrame에서 다음 데이터가 올 때까지
+          // 이 속도로 짧게 외삽(extrapolate)해서 계속 자연스럽게 움직이게 한다.
+          const prevTs=s[side].lastUpdateTs??now;
+          const dtUpdate=Math.max(0.008,(now-prevTs)/1000);
+          s[side].targetVel.set((tx-s[side].targetPos.x)/dtUpdate,(ty-s[side].targetPos.y)/dtUpdate,0);
+          s[side].targetPos.set(tx,ty,0);
+          s[side].targetDir.copy(rawDir);
+          s[side].lastUpdateTs=now;
+        }
         s[side].graceCount=0;
         if(side==='right')gotR=true;else gotL=true;
       }
@@ -1104,6 +1119,7 @@ function Saber({type,handDataRef}){
   const hideTimer=useRef(1.2); // 처음부터 표시
   const idleT=useRef(0);
   const prevPos=useRef(new THREE.Vector3());
+  const _extrap=useRef(new THREE.Vector3()); // 외삽된 목표점 재사용(매 프레임 GC 방지)
 
   useFrame((_,dt)=>{
     if(!grp.current)return;
@@ -1114,8 +1130,19 @@ function Saber({type,handDataRef}){
 
       // ── 위치 보간: 지수 감쇠 (프레임레이트 독립적) ──
       // halfLife: 목표까지 절반 거리 도달 시간(초). 작을수록 빠름
-      const tp=data.targetPos??data.pos;
+      let tp=data.targetPos??data.pos;
       if(!tp)return;
+      // 저사양 기기는 mediapipe 콜백 자체가 30fps보다 뜨문뜨문 들어올 수 있다.
+      // 도착한 목표점으로만 lerp하면 다음 콜백이 올 때까지 완전히 멈춰버려서
+      // "움직이다 뚝뚝 끊기는" 느낌이 남 → 마지막 속도(targetVel)로 짧게(최대 180ms)
+      // 외삽해서, 다음 실제 데이터가 오기 전까지도 자연스럽게 계속 움직이게 한다.
+      if(data.targetVel&&data.lastUpdateTs){
+        const sinceUpdate=Math.min((performance.now()-data.lastUpdateTs)/1000,0.18);
+        if(sinceUpdate>0){
+          _extrap.current.set(tp.x+data.targetVel.x*sinceUpdate,tp.y+data.targetVel.y*sinceUpdate,tp.z??0);
+          tp=_extrap.current;
+        }
+      }
       const dist=sPos.current.distanceTo(tp);
       const posHalfLife=Math.max(0.012, 0.038-dist*0.008);
       const posAlpha=1-Math.pow(0.5, dt/posHalfLife);
