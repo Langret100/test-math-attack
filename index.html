@@ -350,7 +350,7 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
     }
     prevWallVisible.current=wallVisible;
 
-    if(!wallVisible)return;
+    if(!wallVisible||wallBreaking){grp.current.visible=false;return;}
 
     // 5초 타이머: wallRef.startTime 기준 (매 벽마다 독립적으로 리셋됨)
     if(w.state==='stopped'){
@@ -451,24 +451,13 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
     if(hitCoolRef.current>0)hitCoolRef.current-=dt;
   });
 
-  if(!wallVisible)return null;
-  if(wallBreaking){
-    return(
-      <group position={[0,WALL_BASE_Y,WALL_SPAWN_Z]}>
-        <BigFlash color="#ffddaa" maxScale={7} life={0.28}/>
-        <ExpandRing color="#ff8822" speed={9} maxR={1.4} life={0.5}/>
-        <ExpandRing color="#ffffff" speed={6.5} maxR={0.9} life={0.35}/>
-        {Array.from({length:10},(_,i)=>(
-          <StarSpark key={`st${i}`} angle={(i/10)*Math.PI*2+Math.random()*0.4}
-            speed={2.5+Math.random()*2} color={i%2===0?'#ffaa33':'#ff5522'} life={0.5+Math.random()*0.4}/>
-        ))}
-        {debrisData.map((d,i)=><WallParticle key={i} {...d}/>)}
-      </group>
-    );
-  }
-
+  // 벽 구조물은 항상 마운트해두고 visible로만 토글한다(useFrame에서 관리).
+  // 예전엔 wallVisible이 false일 때 return null → 벽이 나타날 때마다 mesh/Text/HP바/
+  // 스파크풀 24개를 한꺼번에 새로 생성해서 그 프레임에 렉이 몰렸음(mount 비용).
+  // 이제는 처음 한 번만 만들고 이후로는 group.visible만 바꿔서 렉을 없앤다.
   return(
-    <group ref={grp} position={[0,WALL_BASE_Y,WALL_SPAWN_Z]}>
+    <>
+    <group ref={grp} position={[0,WALL_BASE_Y,WALL_SPAWN_Z]} visible={false}>
       {/* 받침대 — 바닥 그리드 위에 정확히 걸쳐서 "묻혀있던" 느낌 제거 + 구조적 안정감 */}
       <mesh geometry={_wallBaseGeo} position={[0,-1.67,0.05]}>
         <meshStandardMaterial color="#0a0a0c" roughness={0.85} metalness={0.2} emissive="#1a0a00" emissiveIntensity={0.25}/>
@@ -514,6 +503,19 @@ function WallComp({wallRef,playStartRef,handDataRef,onWallHit,onWallBreak,onWall
         </mesh>
       ))}
     </group>
+    {wallBreaking&&(
+      <group position={[0,WALL_BASE_Y,WALL_SPAWN_Z]}>
+        <BigFlash color="#ffddaa" maxScale={7} life={0.28}/>
+        <ExpandRing color="#ff8822" speed={9} maxR={1.4} life={0.5}/>
+        <ExpandRing color="#ffffff" speed={6.5} maxR={0.9} life={0.35}/>
+        {Array.from({length:10},(_,i)=>(
+          <StarSpark key={`st${i}`} angle={(i/10)*Math.PI*2+Math.random()*0.4}
+            speed={2.5+Math.random()*2} color={i%2===0?'#ffaa33':'#ff5522'} life={0.5+Math.random()*0.4}/>
+        ))}
+        {debrisData.map((d,i)=><WallParticle key={i} {...d}/>)}
+      </group>
+    )}
+    </>
   );
 }
 
@@ -1564,14 +1566,14 @@ function NoteComp({data,playStartRef,multRef}){
         <mesh geometry={panelGeo}>
           {_isMobileCache
             ?<meshBasicMaterial color="#1a0010" toneMapped={false} transparent opacity={0.5}/>
-            :<meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6} emissive="#ec4899" emissiveIntensity={0.35} transparent opacity={0.45}/>}
+            :<meshStandardMaterial color="#1a0010" roughness={0.2} metalness={0.6} emissive="#ec4899" emissiveIntensity={0.55} transparent opacity={0.45}/>}
         </mesh>
         <Text position={[0,0,PD/2+0.02]} fontSize={PH*0.65} color="#ff6eb4" anchorX="center" anchorY="middle"
           outlineColor="#ec4899" outlineWidth={0.018}>♥</Text>
         <lineSegments geometry={edgesGeo}>
           <lineBasicMaterial color="#ec4899" toneMapped={false}/>
         </lineSegments>
-        <pointLight color="#ec4899" intensity={1.8} distance={3} decay={2}/>
+        {/* 하트도 장애물과 같은 이유로 pointLight 제거, emissive로만 대체 */}
       </group>
     );
   }
@@ -1616,7 +1618,7 @@ function ObsComp({data,playStartRef}){
   const baseY=data.obstacleType==='top'?3.1:1.7;
   useFrame((s)=>{
     // emissiveIntensity는 PC(meshStandardMaterial)에만 존재, 모바일은 unlit이라 no-op
-    if(mRef.current&&mRef.current.emissiveIntensity!==undefined)mRef.current.emissiveIntensity=0.25+Math.sin(s.clock.elapsedTime*6)*0.35;
+    if(mRef.current&&mRef.current.emissiveIntensity!==undefined)mRef.current.emissiveIntensity=0.4+Math.sin(s.clock.elapsedTime*6)*0.45;
     if(grpRef.current){
       const time=(performance.now()-playStartRef.current)/1000;
       const cz=PLAYER_Z-(data.time-time)*NOTE_SPEED;
@@ -1635,7 +1637,7 @@ function ObsComp({data,playStartRef}){
       <mesh geometry={geoBody}>
         {isMob
           ?<meshBasicMaterial ref={mRef} color={col} toneMapped={false} transparent opacity={0.42} depthWrite={false}/>
-          :<meshStandardMaterial ref={mRef} color={col} emissive={col} emissiveIntensity={0.4} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>}
+          :<meshStandardMaterial ref={mRef} color={col} emissive={col} emissiveIntensity={0.6} roughness={0.15} metalness={0.4} transparent opacity={0.38} depthWrite={false}/>}
       </mesh>
       <lineSegments geometry={geoEdges}>
         <lineBasicMaterial color={col} toneMapped={false} transparent opacity={0.7}/>
@@ -1643,7 +1645,9 @@ function ObsComp({data,playStartRef}){
       <mesh position={conePos} rotation={coneRot} geometry={obsConeGeo}>
         <meshBasicMaterial color={col} toneMapped={false} transparent opacity={0.85}/>
       </mesh>
-      <pointLight color={col} intensity={2.2} distance={5} decay={2}/>
+      {/* 장애물마다 pointLight를 켜면 화면에 동시에 존재하는 조명 개수가 계속 바뀌면서
+          three.js가 셰이더 프로그램을 다시 컴파일해 렉이 생김(노트에서 이미 겪은 문제와 동일)
+          → 실광원 대신 emissive만 더 강하게 줘서 밝기는 비슷하게 유지 */}
     </group>
   );
 }
